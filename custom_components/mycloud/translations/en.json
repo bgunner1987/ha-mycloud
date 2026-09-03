@@ -2,10 +2,23 @@
     "config": {
         "step": {
             "user": {
-                "description": "My Cloud setup wizard",
+                "description": "Configure access to the WD My Cloud API. Optional sleep-aware polling checks every disk over SSH before the first and every later WD API request. The minimum update interval is {minimum_interval} seconds.",
                 "data": {
-                    "username": "Username",
-                    "password": "Password"
+                    "Host": "Host",
+                    "Username": "Username",
+                    "Password": "Password",
+                    "Version": "My Cloud OS version",
+                    "update_interval": "Update interval (seconds)",
+                    "sleep_aware_enabled": "Enable sleep-aware polling",
+                    "ssh_port": "SSH port",
+                    "ssh_username": "SSH username",
+                    "ssh_password": "SSH password",
+                    "drive_devices": "Drive devices"
+                },
+                "data_description": {
+                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Leave disabled for legacy behavior. Unknown states always block WD API polling when enabled.",
+                    "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
+                    "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."
                 }
             }
         },
@@ -13,6 +26,27 @@
             "auth": "Username/Password is wrong.",
             "connection": "Unable to connect to the server.",
             "unknown": "Unknown error occurred."
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Polling options",
+                "description": "Sleep-aware polling checks every configured drive with hdparm before it contacts the WD API. The minimum update interval is {minimum_interval} seconds.",
+                "data": {
+                    "update_interval": "Update interval (seconds)",
+                    "sleep_aware_enabled": "Enable sleep-aware polling",
+                    "ssh_port": "SSH port",
+                    "ssh_username": "SSH username",
+                    "ssh_password": "SSH password",
+                    "drive_devices": "Drive devices"
+                },
+                "data_description": {
+                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Unknown states always block WD API polling.",
+                    "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
+                    "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."
+                }
+            }
         }
     }
 }

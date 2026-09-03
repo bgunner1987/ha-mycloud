@@ -4,7 +4,7 @@
 
 Home Assistant integration for Western Digital My Cloud NAS devices.
 
-This integration is powered by the [wdnas-client](https:/Python/Projects/WDNAS-Client) Python library, which handles all communication with the NAS.
+This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas_client) Python library, which handles all communication with the NAS.
 
 ---
 
@@ -13,6 +13,7 @@ This integration is powered by the [wdnas-client](https:/Python/Projects/WDNAS-C
 - **Device Information**: See key details like serial number, name, and firmware version.
 - **Disk Information**: See key details about disks, including their health status.
 - **Volume Information**: View all volumes size, encryption status and more.
+- **Optional sleep-aware polling**: Check disk power state over SSH before calling the WD API, retaining the last successful sensor values while disks sleep.
 
 ---
 
@@ -39,6 +40,29 @@ This integration is powered by the [wdnas-client](https:/Python/Projects/WDNAS-C
 3.  Enter your device's **IP address** or **hostname** (e.g., `192.168.1.10` or `wdmycloud`). Do **not** include `http://` or `https://`.
 4.  Enter your username and password (Must be an **admin** account)
 5. Select NAS software version (Currently 2 or 5 are supported)
+
+### Optional sleep-aware polling
+
+Sleep-aware polling is disabled by default, so existing installations continue to use the WD API normally. It can be enabled during a new integration setup or later in the integration's **Configure** dialog. Set:
+
+- **Enable sleep-aware polling**: enabled
+- **SSH port**: `22` (default)
+- **SSH username**: `root` on the tested My Cloud EX2 Ultra
+- **SSH password**: the corresponding SSH password
+- **Drive devices**: comma-separated whole-disk paths, for example `/dev/sda,/dev/sdc`
+
+The feature requires SSH to be enabled on the NAS, `/usr/bin/hdparm` to be present, and the SSH user to have permission to run `/usr/bin/hdparm -C` for every configured drive. Device paths are restricted to whole SATA/SCSI disk names such as `/dev/sda`; shell fragments and partition paths are rejected.
+
+Each polling cycle first runs only `/usr/bin/hdparm -C` sequentially for the configured drives. The WD API is contacted only when **every** drive reports `active/idle`. A `standby`, `unknown`, malformed response, timeout, SSH failure, host-key mismatch, or mixed active/standby result blocks the complete WD API refresh. The integration never calls `smartctl` and does not use `/tmp/standby`.
+
+After a successful full refresh, the four WD API results are saved in Home Assistant storage. While polling is blocked, temperature, storage, health, and volume entities retain that last successful snapshot and expose `data_stale: true` plus `last_successful_update`. Disk Sleeping entities use the live `hdparm` result: `standby` is on, `active/idle` is off, and an unknown/error result is unavailable. The power check itself does not rewrite the cache on every interval.
+
+On the first setup there is no snapshot to retain. Enable sleep-aware mode only when the NAS disks are already awake and allow one successful refresh. If the disks are sleeping or their state is unknown, setup stops with a message asking you to wake them; it does not silently call the WD API. There is no automatic force refresh.
+
+The first successful SSH connection uses trust on first use (TOFU): Home Assistant stores the server's SHA-256 host-key fingerprint and requires the same key on later connections. If the NAS host key legitimately changes, verify the new key independently and re-create the integration to establish a new trust record.
+
+> [!WARNING]
+> SSH credentials grant powerful access, especially when using `root`. Home Assistant stores the configured password, and backups may contain it. Use a dedicated/restricted SSH account where the NAS supports one, protect Home Assistant and its backups, and never reuse this password elsewhere.
 
 ---
 
