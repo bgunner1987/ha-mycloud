@@ -4,3 +4,18 @@ HOST = "Host"
 USERNAME = "Username"
 PASSWORD = "Password"
 VERSION = "Version"
+
+CONF_UPDATE_INTERVAL = "update_interval"
+CONF_SLEEP_AWARE_ENABLED = "sleep_aware_enabled"
+CONF_SSH_PORT = "ssh_port"
+CONF_SSH_USERNAME = "ssh_username"
+CONF_SSH_PASSWORD = "ssh_password"
+CONF_DRIVE_DEVICES = "drive_devices"
+
+DEFAULT_UPDATE_INTERVAL = 600
+DEFAULT_SSH_PORT = 22
+DEFAULT_SSH_USERNAME = "root"
+DEFAULT_DRIVE_DEVICES = "/dev/sda,/dev/sdc"
+
+CACHE_STORE_VERSION = 1
+CACHE_STORE_KEY = f"{DOMAIN}.sleep_aware"

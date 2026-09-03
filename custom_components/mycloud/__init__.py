@@ -1,41 +1,41 @@
-import logging
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
-from .const import DOMAIN, HOST, USERNAME, PASSWORD, VERSION
+"""WD My Cloud integration."""
 
+import logging
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+PLATFORMS = ["sensor"]
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up one My Cloud config entry."""
     _LOGGER.info("Setting up My Cloud integration")
-
-    host = entry.data["Host"]
-    username = entry.data["Username"]
-    password = entry.data["Password"]
-    version = entry.data["Version"]
-
-    hass.data.setdefault(DOMAIN, {})[HOST] = host
-    hass.data.setdefault(DOMAIN, {})[USERNAME] = username
-    hass.data.setdefault(DOMAIN, {})[PASSWORD] = password
-    hass.data.setdefault(DOMAIN, {})[VERSION] = version
-
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {}
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
-
-
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
-
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["sensor"])
-    
-    if unload_ok:
-        pass
 
-    return unload_ok
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry and exactly its own resources."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
+
+    domain_data = hass.data.get(DOMAIN, {})
+    resources = domain_data.pop(entry.entry_id, {})
+    async_close = resources.get("async_close")
+    if async_close is not None:
+        await async_close()
+    if not domain_data:
+        hass.data.pop(DOMAIN, None)
+    return True
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload config entry."""
+    """Reload a config entry after options change."""
     await hass.config_entries.async_reload(entry.entry_id)
