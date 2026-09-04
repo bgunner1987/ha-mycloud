@@ -23,12 +23,16 @@
             }
         },
         "error": {
+            "invalid_drive_devices": "Enter unique whole-disk paths separated by commas, for example /dev/sda,/dev/sdc. Partitions and shell commands are not allowed.",
             "auth": "Username/Password is wrong.",
             "connection": "Unable to connect to the server.",
             "unknown": "Unknown error occurred."
         }
     },
     "options": {
+        "error": {
+            "invalid_drive_devices": "Enter unique whole-disk paths separated by commas, for example /dev/sda,/dev/sdc. Partitions and shell commands are not allowed."
+        },
         "step": {
             "init": {
                 "title": "Polling options",

@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. The current development version is on `main`; select `main` when testing before a release is published.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.1` (manifest version `1.3.1`) or select `main` when testing current development changes.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -53,6 +53,8 @@ Sleep-aware polling is disabled by default, so existing installations continue t
 
 The feature requires SSH to be enabled on the NAS, `/usr/bin/hdparm` to be present, and the SSH user to have permission to run `/usr/bin/hdparm -C` for every configured drive. Device paths are restricted to whole SATA/SCSI disk names such as `/dev/sda`; shell fragments and partition paths are rejected.
 
+Both setup and options forms show drive devices as a serializable text field. On submission, paths are trimmed, validated, and stored in canonical comma-separated form. Invalid input displays an error at the drive-devices field; no settings are saved. Validation applies even when sleep-aware polling is disabled, and the SSH client independently validates device paths before constructing any commands.
+
 Each polling cycle runs only `/usr/bin/hdparm -C` sequentially for the configured drives. The WD API is contacted **once per observed wake phase**, and only when **every** drive reports `active/idle`:
 
 - At startup, one full poll is pending, whether or not a stored snapshot exists.
@@ -75,6 +77,12 @@ The first successful SSH connection uses trust on first use (TOFU): Home Assista
 ---
 
 ## Supported Devices & Contributing
+
+### Tests
+
+With Python 3.12, install `requirements-test.txt`, then run `python -m pytest -q` and `python -m ruff check .`. Config/options tests serialize their actual Voluptuous schemas with the real `voluptuous_serialize.convert` implementation and reproduce the former free-function-validator failure as a negative control. Only the surrounding Home Assistant lifecycle/password-selector interfaces are stubbed; schema serialization and drive-path parsing are not. GitHub Actions also runs these regression tests, HACS validation, and Hassfest.
+
+### Devices
 
 This integration currently supports V2 and V5 firmware. You can see a list of tested models in the client library's documentation:
 

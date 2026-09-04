@@ -1,0 +1,7 @@
+asyncssh==2.24.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.6
+voluptuous==0.16.0
+voluptuous-serialize==2.7.0
+wdnas-client==0.9.4

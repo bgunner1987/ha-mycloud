@@ -23,12 +23,16 @@
             }
         },
         "error": {
+            "invalid_drive_devices": "Eindeutige Pfade ganzer Festplatten durch Kommas trennen, zum Beispiel /dev/sda,/dev/sdc. Partitionen und Shell-Befehle sind nicht erlaubt.",
             "auth": "Benutzername oder Passwort ist falsch.",
             "connection": "Verbindung zum Server nicht möglich.",
             "unknown": "Ein unbekannter Fehler ist aufgetreten."
         }
     },
     "options": {
+        "error": {
+            "invalid_drive_devices": "Eindeutige Pfade ganzer Festplatten durch Kommas trennen, zum Beispiel /dev/sda,/dev/sdc. Partitionen und Shell-Befehle sind nicht erlaubt."
+        },
         "step": {
             "init": {
                 "title": "Abfrageoptionen",
