@@ -1,6 +1,6 @@
 # <img src="images/icon.png" alt="WD My Cloud App Icon" width="100"> ha-mycloud
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=J-shw&repository=ha-mycloud&category=Integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=bgunner1987&repository=ha-mycloud&category=Integration)
 
 Home Assistant integration for Western Digital My Cloud NAS devices.
 
@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add this repository in HACS.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. The current development version is on `main`; select `main` when testing before a release is published.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -53,9 +53,17 @@ Sleep-aware polling is disabled by default, so existing installations continue t
 
 The feature requires SSH to be enabled on the NAS, `/usr/bin/hdparm` to be present, and the SSH user to have permission to run `/usr/bin/hdparm -C` for every configured drive. Device paths are restricted to whole SATA/SCSI disk names such as `/dev/sda`; shell fragments and partition paths are rejected.
 
-Each polling cycle first runs only `/usr/bin/hdparm -C` sequentially for the configured drives. The WD API is contacted only when **every** drive reports `active/idle`. A `standby`, `unknown`, malformed response, timeout, SSH failure, host-key mismatch, or mixed active/standby result blocks the complete WD API refresh. The integration never calls `smartctl` and does not use `/tmp/standby`.
+Each polling cycle runs only `/usr/bin/hdparm -C` sequentially for the configured drives. The WD API is contacted **once per observed wake phase**, and only when **every** drive reports `active/idle`:
 
-After a successful full refresh, the four WD API results are saved in Home Assistant storage. While polling is blocked, temperature, storage, health, and volume entities retain that last successful snapshot and expose `data_stale: true` plus `last_successful_update`. Disk Sleeping entities use the live `hdparm` result: `standby` is on, `active/idle` is off, and an unknown/error result is unavailable. The power check itself does not rewrite the cache on every interval.
+- At startup, one full poll is pending, whether or not a stored snapshot exists.
+- The first all-active check performs that full poll (system info, system status, device info, and firmware version).
+- Further all-active checks only run `hdparm -C` and return the cached snapshot, without contacting or logging in to the WD API again.
+- A `standby`, `unknown`, malformed response, timeout, SSH failure, host-key mismatch, or mixed active/standby result blocks all WD API access and arms one full poll for the next all-active check.
+- The wake-phase state is not persisted. After a Home Assistant restart, already-awake disks may be queried once again.
+
+This avoids repeatedly resetting a 10-minute NAS standby timer with a 600-second API polling interval. A sleep/wake transition must actually be observed by a power check to arm another poll. There are no periodic WD API refreshes during a continuous observed wake phase. An API failure also consumes that phase's attempt; the existing single HTTP-403 reauthentication retry is bounded within that attempt. Subsequent checks retain cached values (or report no available cache) until another phase or restart. The integration never calls `smartctl` and does not use `/tmp/standby`.
+
+After a successful full refresh, the four WD API results are saved in Home Assistant storage. Whenever no API refresh is performed (including later all-active checks), temperature, storage, health, and volume entities retain that last successful snapshot and expose `data_stale: true` plus the unchanged `last_successful_update`. Disk Sleeping entities use the live `hdparm` result: `standby` is on, `active/idle` is off, and an unknown/error result is unavailable. The power check itself does not rewrite the cache on every interval.
 
 On the first setup there is no snapshot to retain. Enable sleep-aware mode only when the NAS disks are already awake and allow one successful refresh. If the disks are sleeping or their state is unknown, setup stops with a message asking you to wake them; it does not silently call the WD API. There is no automatic force refresh.
 
@@ -74,7 +82,7 @@ This integration currently supports V2 and V5 firmware. You can see a list of te
 
 **Want to add your device?**
 
-If your model isn't on the list, or if you have a different firmware version, I'd love to add support for it. Please **[open a GitHub Issue](https://github.com/J-shw/ha-mycloud/issues/new?template=new_device_request.md)** and we can work together to get it added.
+If your model isn't on the list, or if you have a different firmware version, I'd love to add support for it. Please **[open a GitHub Issue](https://github.com/bgunner1987/ha-mycloud/issues/new?template=new_device_request.md)** and we can work together to get it added.
 
 ---
 

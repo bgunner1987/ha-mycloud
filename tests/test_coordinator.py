@@ -99,8 +99,10 @@ class FakeProbe:
         self.states = states
         self.error = error
         self.closed = 0
+        self.checks = 0
 
     async def async_check(self):
+        self.checks += 1
         if self.error:
             raise PowerProbeError("timeout")
         return dict(self.states)
@@ -156,14 +158,16 @@ async def test_standby_or_mixed_state_skips_api_and_keeps_cache(states):
 
 
 @pytest.mark.asyncio
-async def test_all_active_runs_dynamic_refresh_only_with_cache():
+async def test_all_active_runs_full_refresh_with_cache():
     states = {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_ACTIVE}
     api = FakeAPI()
     coordinator, store = make_coordinator(api, FakeProbe(states))
 
     result = await coordinator._async_update_data()
 
-    assert api.calls == ["enter", "system_info", "system_status"]
+    assert api.calls == [
+        "enter", "system_info", "system_status", "device_info", "system_version"
+    ]
     assert result["data_stale"] is False
     assert result["device_info"] == SAMPLE_DATA["device_info"]
     assert len(store.saved) == 1
@@ -275,3 +279,169 @@ async def test_shutdown_closes_http_and_ssh_once():
 
     assert api.calls.count("exit") == 1
     assert probe.closed == 1
+
+
+ALL_ACTIVE = {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_ACTIVE}
+BLOCKED_STATES = [
+    {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_STANDBY},
+    {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_STANDBY},
+    {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": POWER_UNKNOWN},
+    {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_UNKNOWN},
+    {"/dev/sda": POWER_ACTIVE},
+    {},
+    None,  # SSH error: the coordinator must treat it as unknown.
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_cache", [False, True])
+async def test_continuous_all_active_polls_api_only_once(with_cache):
+    api = FakeAPI()
+    probe = FakeProbe(ALL_ACTIVE)
+    coordinator, store = make_coordinator(api, probe, with_cache=with_cache)
+
+    first = await coordinator._async_update_data()
+    calls_after_first = list(api.calls)
+    saves_after_first = len(store.saved)
+    assert first["data_stale"] is False
+    for _ in range(4):
+        result = await coordinator._async_update_data()
+        assert api.calls == calls_after_first
+        assert len(store.saved) == saves_after_first
+        assert result["last_full_update"] == first["last_full_update"]
+        assert result["data_stale"] is True
+        assert result["power_states"] == ALL_ACTIVE
+        for key in SAMPLE_DATA:
+            assert result[key] == first[key]
+
+    assert probe.checks == 5
+    assert api.calls == [
+        "enter", "system_info", "system_status", "device_info", "system_version"
+    ]
+    # The wake-phase allowance is intentionally not part of persistent storage.
+    assert set(store.saved[-1]) == {"data", "last_full_update", "ssh_host_key"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_states", BLOCKED_STATES)
+async def test_blocked_probe_rearms_exactly_one_full_wake_poll(blocked_states):
+    api = FakeAPI()
+    probe = FakeProbe(ALL_ACTIVE)
+    coordinator, store = make_coordinator(api, probe)
+    first = await coordinator._async_update_data()
+    calls_after_first = list(api.calls)
+    saves_after_first = len(store.saved)
+
+    probe.states = blocked_states
+    probe.error = blocked_states is None
+    for _ in range(2):
+        blocked = await coordinator._async_update_data()
+        assert api.calls == calls_after_first
+        assert len(store.saved) == saves_after_first
+        assert blocked["data_stale"] is True
+        assert blocked["last_full_update"] == first["last_full_update"]
+        for key in SAMPLE_DATA:
+            assert blocked[key] == first[key]
+
+    probe.states = ALL_ACTIVE
+    probe.error = False
+    awake = await coordinator._async_update_data()
+    assert awake["data_stale"] is False
+    assert api.calls.count("enter") == 1
+    assert api.calls.count("login") == 0
+    for endpoint in SAMPLE_DATA:
+        assert api.calls.count(endpoint) == 2
+    assert len(store.saved) == saves_after_first + 1
+
+    for _ in range(3):
+        cached = await coordinator._async_update_data()
+        assert cached["last_full_update"] == awake["last_full_update"]
+        for endpoint in SAMPLE_DATA:
+            assert api.calls.count(endpoint) == 2
+            assert cached[endpoint] == awake[endpoint]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_states", BLOCKED_STATES)
+async def test_no_cache_waits_for_all_active_before_first_poll(blocked_states):
+    api = FakeAPI()
+    probe = FakeProbe(blocked_states, error=blocked_states is None)
+    coordinator, _ = make_coordinator(api, probe, with_cache=False)
+
+    for _ in range(2):
+        with pytest.raises(UpdateFailed, match="Wake the NAS disks once"):
+            await coordinator._async_update_data()
+        assert api.calls == []
+
+    probe.states = ALL_ACTIVE
+    probe.error = False
+    result = await coordinator._async_update_data()
+    for endpoint, value in SAMPLE_DATA.items():
+        assert result[endpoint] == value
+        assert api.calls.count(endpoint) == 1
+    await coordinator._async_update_data()
+    assert api.calls.count("system_info") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_cache", [False, True])
+async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cache):
+    api = FakeAPI([RuntimeError("unavailable")])
+    probe = FakeProbe(ALL_ACTIVE)
+    coordinator, _ = make_coordinator(api, probe, with_cache=with_cache)
+
+    with pytest.raises(UpdateFailed, match="Error fetching data"):
+        await coordinator._async_update_data()
+    for _ in range(3):
+        if with_cache:
+            result = await coordinator._async_update_data()
+            assert result["data_stale"] is True
+            for key, value in SAMPLE_DATA.items():
+                assert result[key] == value
+        else:
+            with pytest.raises(UpdateFailed, match="poll for this wake phase failed"):
+                await coordinator._async_update_data()
+        assert api.calls.count("system_info") == 1
+
+    probe.states = BLOCKED_STATES[0]
+    if with_cache:
+        await coordinator._async_update_data()
+    else:
+        with pytest.raises(UpdateFailed, match="Wake the NAS disks once"):
+            await coordinator._async_update_data()
+    probe.states = ALL_ACTIVE
+    await coordinator._async_update_data()
+    assert api.calls.count("system_info") == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_allows_one_new_poll_with_persisted_snapshot():
+    api = FakeAPI()
+    coordinator, store = make_coordinator(api, FakeProbe(ALL_ACTIVE))
+    await coordinator._async_update_data()
+    restarted = MyCloudDataUpdateCoordinator(
+        hass=object(),
+        logger=logging.getLogger("test"),
+        api_client=FakeAPI(),
+        store=FakeStore(),
+        update_interval=timedelta(seconds=600),
+        config_entry=object(),
+        cached_envelope=store.saved[-1],
+        power_client=FakeProbe(ALL_ACTIVE),
+    )
+
+    fresh = await restarted._async_update_data()
+    cached = await restarted._async_update_data()
+    assert fresh["data_stale"] is False
+    assert cached["data_stale"] is True
+    assert restarted._api_client.calls.count("system_info") == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_mode_still_polls_every_interval():
+    api = FakeAPI()
+    coordinator, _ = make_coordinator(api)
+    for _ in range(3):
+        result = await coordinator._async_update_data()
+        assert result["data_stale"] is False
+    assert api.calls == ["enter"] + ["system_info", "system_status"] * 3

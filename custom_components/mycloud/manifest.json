@@ -1,11 +1,11 @@
 {
   "domain": "mycloud",
   "name": "My Cloud",
-  "codeowners": ["@J-shw"],
+  "codeowners": ["@bgunner1987"],
   "config_flow": true,
-  "documentation": "https://github.com/J-shw/wdnas_hacs",
+  "documentation": "https://github.com/bgunner1987/ha-mycloud",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/J-shw/wdnas_hacs/issues",
+  "issue_tracker": "https://github.com/bgunner1987/ha-mycloud/issues",
   "requirements": ["asyncssh==2.24.0", "wdnas-client>=0.9.4"],
   "version": "1.3.0"
 }

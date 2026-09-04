@@ -2,7 +2,7 @@
     "config": {
         "step": {
             "user": {
-                "description": "Configure access to the WD My Cloud API. Optional sleep-aware polling checks every disk over SSH before the first and every later WD API request. The minimum update interval is {minimum_interval} seconds.",
+                "description": "Configure access to the WD My Cloud API. Optional sleep-aware polling checks every disk over SSH and performs one full API poll per observed wake phase. Further active checks use cached values. The minimum update interval is {minimum_interval} seconds.",
                 "data": {
                     "Host": "Host",
                     "Username": "Username",
@@ -32,7 +32,7 @@
         "step": {
             "init": {
                 "title": "Polling options",
-                "description": "Sleep-aware polling checks every configured drive with hdparm before it contacts the WD API. The minimum update interval is {minimum_interval} seconds.",
+                "description": "Sleep-aware polling checks every configured drive with hdparm and performs one full WD API poll per observed wake phase. Further active checks use cached values until a non-active state is observed. The minimum update interval is {minimum_interval} seconds.",
                 "data": {
                     "update_interval": "Update interval (seconds)",
                     "sleep_aware_enabled": "Enable sleep-aware polling",

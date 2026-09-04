@@ -74,6 +74,9 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.power_client = power_client
         self.drive_devices = power_client.drive_devices if power_client else ()
         self._last_probe_summary: tuple[str, ...] | None = None
+        # Runtime-only: allow one attempt after startup or a non-active probe.
+        # Consume before API access, so API errors cannot keep the disks awake.
+        self._wake_poll_pending = True
         self._closed = False
 
     async def _async_save_cache(self) -> None:
@@ -106,7 +109,9 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._api_started = True
 
     async def _async_fetch_once(self) -> dict[str, Any]:
-        include_static = self._cached_data is None
+        # A wake-phase poll refreshes the entire snapshot. Legacy polling keeps
+        # its existing dynamic-only refresh when a snapshot is already cached.
+        include_static = self.power_client is not None or self._cached_data is None
         result = {
             "system_info": await self._api_client.system_info(),
             "system_status": await self._api_client.system_status(),
@@ -155,7 +160,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_probe_summary = summary
         if all(state == POWER_ACTIVE for state in summary):
             self._integration_logger.debug(
-                "All configured drives are active; WD API polling is allowed"
+                "All configured drives are active; checking wake-phase poll allowance"
             )
         else:
             self._integration_logger.info(
@@ -175,16 +180,31 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 power_states = {
                     device: POWER_UNKNOWN for device in self.drive_devices
                 }
+            all_active = bool(self.drive_devices) and all(
+                power_states.get(device) == POWER_ACTIVE
+                for device in self.drive_devices
+            )
+            if not all_active:
+                self._wake_poll_pending = True
+
             await self._async_persist_new_fingerprint()
             self._log_probe_transition(power_states)
 
-            if not self.drive_devices or not all(
-                power_states.get(device) == POWER_ACTIVE
-                for device in self.drive_devices
-            ):
+            if not all_active:
                 if self._cached_data is None:
                     raise UpdateFailed(FIRST_SETUP_MESSAGE)
                 return self._cached_result(power_states, last_power_check, True)
+
+            if not self._wake_poll_pending:
+                if self._cached_data is None:
+                    raise UpdateFailed(
+                        "The WD API poll for this wake phase failed and no cached "
+                        "data is available. Waiting for the next observed wake "
+                        "phase or an integration restart before trying again."
+                    )
+                return self._cached_result(power_states, last_power_check, True)
+
+            self._wake_poll_pending = False
 
         try:
             await self._async_start_api()
