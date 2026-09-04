@@ -16,6 +16,7 @@ from .power_probe import (
     PowerProbeError,
     SSHPowerStateClient,
 )
+from .probe_diagnostics import describe_probe_error, log_probe_failure
 
 FIRST_SETUP_MESSAGE = (
     "Sleep-aware polling found sleeping or unknown disks and no cached data. "
@@ -79,6 +80,12 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.power_client = power_client
         self.drive_devices = power_client.drive_devices if power_client else ()
         self._last_probe_summary: tuple[str, ...] | None = None
+        self.last_power_check: str | None = None
+        self.power_states: dict[str, str] = {}
+        self.power_probe_status = "pending" if power_client else "disabled"
+        self.power_probe_error_type: str | None = None
+        self.last_power_probe_error: str | None = None
+        self._last_logged_probe_failure = None
         # Runtime-only: allow one attempt after startup or a non-active probe.
         # Consume before API access, so API errors cannot keep the disks awake.
         self._wake_poll_pending = True
@@ -147,23 +154,28 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._api_client.login()
         return await self._async_fetch_once()
 
-    def _cached_result(
-        self,
-        power_states: dict[str, str],
-        last_power_check: str | None,
-        data_stale: bool,
-    ) -> dict[str, Any]:
+    @property
+    def power_probe_diagnostics(self) -> dict[str, Any]:
+        """Expose safe runtime diagnostics, including when no snapshot exists."""
+        return {
+            "last_power_check": self.last_power_check,
+            "power_states": dict(self.power_states),
+            "power_probe_status": self.power_probe_status,
+            "power_probe_error_type": self.power_probe_error_type,
+            "last_power_probe_error": self.last_power_probe_error,
+        }
+
+    def _cached_result(self, data_stale: bool) -> dict[str, Any]:
         assert self._cached_data is not None
         result = deepcopy(self._cached_data)
         result.update(
             {
-                "power_states": power_states,
                 "data_stale": data_stale,
                 "last_full_update": self._last_full_update,
-                "last_power_check": last_power_check,
                 "sleep_aware_enabled": self.power_client is not None,
             }
         )
+        result.update(self.power_probe_diagnostics)
         return result
 
     def _log_probe_transition(self, states: dict[str, str]) -> None:
@@ -189,10 +201,34 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             last_power_check = _utc_now()
             try:
                 power_states = await self.power_client.async_check()
-            except PowerProbeError:
+            except PowerProbeError as err:
                 power_states = {
                     device: POWER_UNKNOWN for device in self.drive_devices
                 }
+                failure = describe_probe_error(err)
+                self.power_probe_status = "error"
+                self.power_probe_error_type = failure.error_type
+                self.last_power_probe_error = failure.summary
+                if failure != self._last_logged_probe_failure:
+                    log_probe_failure(self._integration_logger, failure)
+                    self._last_logged_probe_failure = failure
+            else:
+                self.power_probe_status = (
+                    "unknown" if any(
+                        power_states.get(device) not in ("active/idle", "standby")
+                        for device in self.drive_devices
+                    ) else "ok"
+                )
+                self.power_probe_error_type = None
+                self._last_logged_probe_failure = None
+            # Export only configured paths and known states, never SSH output.
+            power_states = {
+                device: power_states.get(device)
+                if power_states.get(device) in ("active/idle", "standby") else POWER_UNKNOWN
+                for device in self.drive_devices
+            }
+            self.last_power_check = last_power_check
+            self.power_states = power_states
             all_active = bool(self.drive_devices) and all(
                 power_states.get(device) == POWER_ACTIVE
                 for device in self.drive_devices
@@ -206,7 +242,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not all_active:
                 if self._cached_data is None:
                     raise UpdateFailed(FIRST_SETUP_MESSAGE)
-                return self._cached_result(power_states, last_power_check, True)
+                return self._cached_result(True)
 
             if not self._wake_poll_pending:
                 if self._cached_data is None:
@@ -215,7 +251,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "data is available. Waiting for the next observed wake "
                         "phase or an integration restart before trying again."
                     )
-                return self._cached_result(power_states, last_power_check, True)
+                return self._cached_result(True)
 
             self._wake_poll_pending = False
 
@@ -228,7 +264,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cached_data = fresh_data
         self._last_full_update = _utc_now()
         await self._async_save_cache()
-        return self._cached_result(power_states, last_power_check, False)
+        return self._cached_result(False)
 
     async def async_shutdown(self) -> None:
         """Close each owned resource at most once."""

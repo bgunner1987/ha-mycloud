@@ -208,6 +208,7 @@ class MyCloudCachedEntity(CoordinatorEntity):
         return {
             "data_stale": bool(self.coordinator.data.get("data_stale", False)),
             "last_successful_update": self.coordinator.data.get("last_full_update"),
+            **self.coordinator.power_probe_diagnostics,
         }
 
 

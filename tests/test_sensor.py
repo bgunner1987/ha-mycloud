@@ -18,6 +18,7 @@ from custom_components.mycloud.sensor import (
 def make_coordinator(power_state):
     return SimpleNamespace(
         last_update_success=True,
+        power_probe_diagnostics={},
         data={
             "system_info": {
                 "disks": [{"name": "1", "temp": 31, "sleep": False}]

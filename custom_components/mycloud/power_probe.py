@@ -6,9 +6,12 @@ import asyncio
 import hmac
 import re
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from typing import Any
 
 import asyncssh
+
+from .probe_diagnostics import PowerProbeError
 
 HDPARM_PATH = "/usr/bin/hdparm"
 POWER_ACTIVE = "active/idle"
@@ -20,10 +23,6 @@ _STATE_PATTERN = re.compile(
     r"drive\s+state\s+is\s*:\s*(standby|active/idle|unknown)\b",
     re.IGNORECASE,
 )
-
-
-class PowerProbeError(Exception):
-    """Raised when a power-state check cannot be completed safely."""
 
 
 def parse_drive_devices(value: str | Sequence[str]) -> tuple[str, ...]:
@@ -137,8 +136,12 @@ class SSHPowerStateClient:
                 timeout=self._timeout,
             )
         except Exception as err:
-            await self.async_close()
-            raise PowerProbeError("SSH connection or host-key validation failed") from err
+            with suppress(Exception):
+                await self.async_close()
+            raise PowerProbeError(
+                "SSH connection or host-key validation failed",
+                stage="connect", detail="connect_failed",
+            ) from err
 
         if self._expected_fingerprint is None and self._observed_fingerprint:
             self._fingerprint = self._observed_fingerprint
@@ -158,14 +161,28 @@ class SSHPowerStateClient:
                     timeout=self._timeout,
                 )
                 if result.exit_status != 0:
-                    states[device] = POWER_UNKNOWN
-                    continue
-                states[device] = parse_hdparm_state(
-                    f"{result.stdout or ''}\n{result.stderr or ''}"
-                )
+                    raise PowerProbeError(
+                        "SSH power-state command failed", stage="command",
+                        error_type="command_failed", detail="nonzero_exit",
+                        exit_status=result.exit_status,
+                    )
+                output = f"{result.stdout or ''}\n{result.stderr or ''}"
+                if _STATE_PATTERN.search(output) is None:
+                    raise PowerProbeError(
+                        "Unrecognized hdparm response", stage="command",
+                        error_type="parse_failed", detail="unrecognized_hdparm_output",
+                    )
+                states[device] = parse_hdparm_state(output)
+        except PowerProbeError:
+            with suppress(Exception):
+                await self.async_close()
+            raise
         except Exception as err:
-            await self.async_close()
-            raise PowerProbeError("SSH power-state command failed") from err
+            with suppress(Exception):
+                await self.async_close()
+            raise PowerProbeError(
+                "SSH power-state command failed", stage="command", detail="command_failed",
+            ) from err
 
         return states
 

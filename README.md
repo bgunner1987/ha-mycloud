@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.2` (manifest version `1.3.2`) or select `main` when testing current development changes.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.3` (manifest version `1.3.3`) or select `main` when testing current development changes.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -77,6 +77,22 @@ Physical disk entities in sleep-aware mode match API names exactly to the basena
 The first successful SSH connection uses trust on first use (TOFU): Home Assistant stores the server's SHA-256 host-key fingerprint and requires the same key on later connections. If the NAS host key legitimately changes, verify the new key independently and re-create the integration to establish a new trust record.
 
 AsyncSSH receives an explicit empty known-hosts object, not empty bytes or `None`. This prevents fallback to ambient `~/.ssh/known_hosts` while keeping the integration's TOFU/pin-verification callback mandatory.
+
+### Diagnosing unavailable Sleeping sensors
+
+If Sleeping sensors stay unavailable, inspect a **CPU or Memory sensor** in **Developer Tools > States**. System sensors remain available from the stored snapshot during SSH failures; their attributes include:
+
+- `last_power_check`: timestamp of the latest power probe, even on failure.
+- `power_states`: validated configured paths and their active/idle, standby, or unknown states.
+- `power_probe_status`: `pending`, `disabled`, `ok` (a readable probe, including standby/mixed), `unknown` (hdparm explicitly reports unknown), or `error`.
+- `power_probe_error_type`: current failure category, or null after a successful probe.
+- `last_power_probe_error`: safe description of the most recent error, retained after recovery until the integration restarts. Check status/error_type to determine whether it is still current.
+
+Failure categories are `authentication_failed`, `host_key_mismatch`, `algorithm_negotiation_failed`, `connection_failed`, `command_failed`, `timeout`, and `parse_failed`. Nonzero command exits and malformed hdparm responses now produce explicit diagnostics; a valid hdparm response of `unknown` is not a parser error. Partial results on a failed probe are discarded and every configured drive is reported unknown.
+
+The first failure and each changed safe cause emit a warning with `exc_info=True` and a sanitized copy of the complete exception chain. Identical consecutive failures are suppressed; after a successful probe, a recurring failure is logged again. Known exception types, the connect/command stage, symbolic OS errors, command exit status, and known negotiation-failure categories identify the cause. Raw exception messages, server output/algorithm lists, usernames, passwords, host-key contents, fingerprints, and original traceback frames/locals are **not** sent to logging handlers. Changing only sensitive free text does not cause another log entry.
+
+These diagnostics are runtime-only and are not saved in the persistent NAS cache. They are also recorded and logged if no cache exists, although first setup still fails closed without creating sensors. No legacy SSH algorithms are enabled by this diagnostic update. An SSH/probe failure still blocks every WD API request and rearms one snapshot for the next all-active phase.
 
 > [!WARNING]
 > SSH credentials grant powerful access, especially when using `root`. Home Assistant stores the configured password, and backups may contain it. Use a dedicated/restricted SSH account where the NAS supports one, protect Home Assistant and its backups, and never reuse this password elsewhere.

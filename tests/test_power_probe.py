@@ -18,6 +18,7 @@ from custom_components.mycloud.power_probe import (
     parse_drive_devices,
     parse_hdparm_state,
 )
+from custom_components.mycloud.probe_diagnostics import describe_probe_error
 
 
 @pytest.mark.parametrize(
@@ -167,10 +168,153 @@ async def test_real_asyncssh_pin_cannot_be_bypassed_by_ambient_known_hosts(
             await client.async_check()  # Old behavior incorrectly trusts the file.
             assert commands == ["/usr/bin/hdparm -C /dev/sda"]
         else:
-            with pytest.raises(PowerProbeError, match="host-key validation failed"):
+            with pytest.raises(PowerProbeError, match="host-key validation failed") as error:
                 await client.async_check()
+            assert describe_probe_error(error.value).error_type == "host_key_mismatch"
             assert commands == []
             assert client.fingerprint == different_pin
+    finally:
+        await client.async_close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause,expected", [
+    (asyncssh.PermissionDenied("synthetic-private-detail"), "authentication_failed"),
+    (asyncssh.KeyExchangeFailed("synthetic-private-detail"), "algorithm_negotiation_failed"),
+    (ConnectionRefusedError("synthetic-private-detail"), "connection_failed"),
+    (TimeoutError("synthetic-private-detail"), "timeout"),
+])
+async def test_connect_preserves_classifiable_cause(monkeypatch, cause, expected):
+    async def fail_connect(*args, **kwargs):
+        raise cause
+
+    monkeypatch.setattr(asyncssh, "connect", fail_connect)
+    client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
+    with pytest.raises(PowerProbeError) as error:
+        await client.async_check()
+    failure = describe_probe_error(error.value)
+    assert failure.error_type == expected
+    assert failure.stage == "connect"
+    assert error.value.__cause__ is cause
+    assert "synthetic-private-detail" not in failure.summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_status,stdout,expected", [
+    (127, "synthetic-private-detail", "command_failed"),
+    (1, "drive state is: active/idle", "command_failed"),
+    (0, "synthetic-private-detail", "parse_failed"),
+])
+async def test_command_and_parser_failure_are_classified(exit_status, stdout, expected):
+    connection = FakeConnection([])
+
+    async def run(*args, **kwargs):
+        return SimpleNamespace(
+            exit_status=exit_status, stdout=stdout, stderr="synthetic-private-stderr",
+        )
+
+    connection.run = run
+    client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
+    client._connection = connection
+    with pytest.raises(PowerProbeError) as error:
+        await client.async_check()
+    failure = describe_probe_error(error.value)
+    assert failure.error_type == expected
+    assert failure.stage == "command"
+    assert "synthetic-private" not in failure.summary
+    assert connection.closed
+    if exit_status:
+        assert f"exit_status={exit_status}" in failure.summary
+
+
+@pytest.mark.asyncio
+async def test_command_timeout_is_not_masked_by_cleanup_error():
+    connection = FakeConnection([])
+
+    async def run(*args, **kwargs):
+        raise TimeoutError("synthetic-private-detail")
+
+    async def wait_closed():
+        raise RuntimeError("synthetic-private-cleanup")
+
+    connection.run = run
+    connection.wait_closed = wait_closed
+    client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
+    client._connection = connection
+    with pytest.raises(PowerProbeError) as error:
+        await client.async_check()
+    failure = describe_probe_error(error.value)
+    assert failure.error_type == "timeout"
+    assert failure.stage == "command"
+    assert "synthetic-private" not in failure.summary
+
+
+@pytest.mark.asyncio
+async def test_explicit_hdparm_unknown_is_not_a_parser_error():
+    connection = FakeConnection(["drive state is: unknown"])
+    client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
+    client._connection = connection
+    assert await client.async_check() == {"/dev/sda": POWER_UNKNOWN}
+
+
+@pytest.mark.asyncio
+async def test_real_asyncssh_authentication_failure_is_classified():
+    class RejectSSHServer(asyncssh.SSHServer):
+        def begin_auth(self, username):
+            return True
+
+        def password_auth_supported(self):
+            return True
+
+        def validate_password(self, username, password):
+            return False
+
+    server = await asyncssh.listen(
+        "127.0.0.1", 0, server_factory=RejectSSHServer,
+        server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+    )
+    client = SSHPowerStateClient(
+        "127.0.0.1", server.get_port(), "test", "unused-test-value", ("/dev/sda",), timeout=3,
+    )
+    try:
+        with pytest.raises(PowerProbeError) as error:
+            await client.async_check()
+        failure = describe_probe_error(error.value)
+        assert failure.error_type == "authentication_failed"
+        assert any("PermissionDenied" in node for node in failure.chain)
+        assert "unused-test-value" not in failure.summary
+    finally:
+        await client.async_close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_real_asyncssh_algorithm_negotiation_failure_is_classified(monkeypatch):
+    server = await asyncssh.listen(
+        "127.0.0.1", 0, server_factory=LocalSSHServer,
+        server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+        kex_algs=["curve25519-sha256"],
+    )
+    connect = asyncssh.connect
+
+    def incompatible_connect(*args, **kwargs):
+        # Two modern, deliberately disjoint test sets. Production is unchanged.
+        return connect(*args, **kwargs, kex_algs=["ecdh-sha2-nistp256"])
+
+    monkeypatch.setattr(asyncssh, "connect", incompatible_connect)
+    client = SSHPowerStateClient(
+        "127.0.0.1", server.get_port(), "test", "unused-test-value", ("/dev/sda",), timeout=3,
+    )
+    try:
+        with pytest.raises(PowerProbeError) as error:
+            await client.async_check()
+        failure = describe_probe_error(error.value)
+        assert failure.error_type == "algorithm_negotiation_failed"
+        assert "no_matching_key_exchange" in failure.summary
+        assert "unused-test-value" not in failure.summary
     finally:
         await client.async_close()
         server.close()
