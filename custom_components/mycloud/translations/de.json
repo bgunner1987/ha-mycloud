@@ -2,13 +2,14 @@
     "config": {
         "step": {
             "user": {
-                "description": "Zugriff auf die WD-My-Cloud-API einrichten. Die optionale schlafbewusste Abfrage prüft alle Platten per SSH und führt pro erkannter Wachphase genau eine vollständige API-Abfrage aus. Weitere aktive Prüfungen verwenden Cachewerte. Das Mindestintervall beträgt {minimum_interval} Sekunden.",
+                "description": "Zugriff auf die WD-My-Cloud-API einrichten. Die optionale schlafbewusste Abfrage prüft alle Platten per SSH und führt pro erkannter Wachphase genau eine vollständige API-Abfrage aus. Weitere aktive Prüfungen verwenden Cachewerte. Die Leistungszustandsprüfung erfolgt standardmäßig alle 60 Sekunden. Das minimale bisherige API-Intervall beträgt {minimum_interval} Sekunden.",
                 "data": {
                     "Host": "Hostname",
                     "Username": "Benutzername",
                     "Password": "Passwort",
                     "Version": "My-Cloud-OS-Version",
-                    "update_interval": "Prüfintervall (Sekunden)",
+                    "update_interval": "Bisheriges API-Intervall (Sekunden)",
+                    "power_probe_interval": "Prüfintervall des Plattenzustands (Sekunden)",
                     "sleep_aware_enabled": "Schlafbewusste Abfrage aktivieren",
                     "ssh_port": "SSH-Port",
                     "ssh_username": "SSH-Benutzername",
@@ -16,6 +17,8 @@
                     "drive_devices": "Festplattengeräte"
                 },
                 "data_description": {
+                    "update_interval": "Gilt nur bei deaktivierter schlafbewusster Abfrage. Steuert nicht die Prüfung des Plattenzustands.",
+                    "power_probe_interval": "Nicht weckende SSH-/hdparm-Prüfung im schlafbewussten Modus. Standard 60 Sekunden, Minimum 10. Löst keine regelmäßigen WD-API-Abfragen aus.",
                     "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Deaktiviert bleibt das bisherige Verhalten erhalten. Unbekannte Zustände sperren bei aktivierter Funktion immer die WD-API.",
                     "ssh_password": "Wird von Home Assistant gespeichert. Möglichst eigene Zugangsdaten verwenden und den Zugriff auf Home-Assistant-Sicherungen beschränken.",
                     "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc."
@@ -36,9 +39,10 @@
         "step": {
             "init": {
                 "title": "Abfrageoptionen",
-                "description": "Die schlafbewusste Abfrage prüft alle konfigurierten Platten mit hdparm und führt pro erkannter Wachphase genau eine vollständige WD-API-Abfrage aus. Weitere aktive Prüfungen verwenden Cachewerte, bis ein nicht aktiver Zustand erkannt wird. Das Mindestintervall beträgt {minimum_interval} Sekunden.",
+                "description": "Die schlafbewusste Abfrage prüft alle konfigurierten Platten mit hdparm und führt pro erkannter Wachphase genau eine vollständige WD-API-Abfrage aus. Weitere aktive Prüfungen verwenden Cachewerte, bis ein nicht aktiver Zustand erkannt wird. Die Leistungszustandsprüfung erfolgt standardmäßig alle 60 Sekunden. Das minimale bisherige API-Intervall beträgt {minimum_interval} Sekunden.",
                 "data": {
-                    "update_interval": "Prüfintervall (Sekunden)",
+                    "update_interval": "Bisheriges API-Intervall (Sekunden)",
+                    "power_probe_interval": "Prüfintervall des Plattenzustands (Sekunden)",
                     "sleep_aware_enabled": "Schlafbewusste Abfrage aktivieren",
                     "ssh_port": "SSH-Port",
                     "ssh_username": "SSH-Benutzername",
@@ -46,6 +50,8 @@
                     "drive_devices": "Festplattengeräte"
                 },
                 "data_description": {
+                    "update_interval": "Gilt nur bei deaktivierter schlafbewusster Abfrage. Steuert nicht die Prüfung des Plattenzustands.",
+                    "power_probe_interval": "Nicht weckende SSH-/hdparm-Prüfung im schlafbewussten Modus. Standard 60 Sekunden, Minimum 10. Löst keine regelmäßigen WD-API-Abfragen aus.",
                     "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Unbekannte Zustände sperren immer die WD-API.",
                     "ssh_password": "Wird von Home Assistant gespeichert. Möglichst eigene Zugangsdaten verwenden und den Zugriff auf Home-Assistant-Sicherungen beschränken.",
                     "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc."

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
+from custom_components.mycloud import coordinator as coordinator_module
 from custom_components.mycloud.coordinator import (
     FIRST_SETUP_MESSAGE,
     MyCloudDataUpdateCoordinator,
@@ -19,6 +20,7 @@ from custom_components.mycloud.power_probe import (
     POWER_UNKNOWN,
     PowerProbeError,
 )
+from custom_components.mycloud.sensor import MyCloudDiskTempSensor
 
 SAMPLE_DATA = {
     "system_info": {
@@ -385,8 +387,9 @@ async def test_no_cache_waits_for_all_active_before_first_poll(blocked_states):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_cache", [False, True])
-async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cache):
-    api = FakeAPI([RuntimeError("unavailable")])
+@pytest.mark.parametrize("failure", [RuntimeError("unavailable"), ForbiddenError(403)])
+async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cache, failure):
+    api = FakeAPI([failure])
     probe = FakeProbe(ALL_ACTIVE)
     coordinator, _ = make_coordinator(api, probe, with_cache=with_cache)
 
@@ -402,6 +405,7 @@ async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cac
             with pytest.raises(UpdateFailed, match="poll for this wake phase failed"):
                 await coordinator._async_update_data()
         assert api.calls.count("system_info") == 1
+        assert api.calls.count("login") == 0
 
     probe.states = BLOCKED_STATES[0]
     if with_cache:
@@ -412,6 +416,7 @@ async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cac
     probe.states = ALL_ACTIVE
     await coordinator._async_update_data()
     assert api.calls.count("system_info") == 2
+    assert api.calls.count("login") == int(isinstance(failure, ForbiddenError))
 
 
 @pytest.mark.asyncio
@@ -445,3 +450,83 @@ async def test_legacy_mode_still_polls_every_interval():
         result = await coordinator._async_update_data()
         assert result["data_stale"] is False
     assert api.calls == ["enter"] + ["system_info", "system_status"] * 3
+
+
+@pytest.mark.parametrize("sleep_aware,probe_seconds,expected_seconds", [
+    (True, 60, 60), (True, 30, 30), (False, 60, 600),
+])
+def test_coordinator_scheduler_uses_probe_interval_only_in_sleep_aware_mode(
+    sleep_aware, probe_seconds, expected_seconds
+):
+    coordinator = MyCloudDataUpdateCoordinator(
+        hass=object(), logger=logging.getLogger("test"), api_client=FakeAPI(),
+        store=FakeStore(), update_interval=timedelta(seconds=600),
+        power_client=FakeProbe(ALL_ACTIVE) if sleep_aware else None,
+        power_probe_interval=timedelta(seconds=probe_seconds),
+    )
+    assert coordinator.update_interval == timedelta(seconds=expected_seconds)
+
+
+@pytest.mark.asyncio
+async def test_fast_probe_observes_short_phases_and_refreshes_values_and_timestamp(monkeypatch):
+    """Drive the real coordinator on its configured cadence, with a virtual clock.
+
+    At the old 600-second cadence, none of the states between t=60 and t=480
+    would be observed. No sleeps, mocked coordinator, or timing heuristics.
+    """
+    clock = {"seconds": 0}
+    base_time = datetime(2026, 9, 4, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        coordinator_module, "_utc_now",
+        lambda: (base_time + timedelta(seconds=clock["seconds"])).isoformat(),
+    )
+
+    class TimelineProbe(FakeProbe):
+        async def async_check(self):
+            self.checks += 1
+            now = clock["seconds"]
+            if now == 360:
+                raise PowerProbeError("simulated SSH error")
+            if now in (60, 240):
+                state = POWER_STANDBY if now == 60 else POWER_UNKNOWN
+                return dict.fromkeys(self.drive_devices, state)
+            return dict(ALL_ACTIVE)
+
+    class ChangingAPI(FakeAPI):
+        async def system_info(self):
+            data = await super().system_info()
+            data["disks"][0]["temp"] = 31 + clock["seconds"] // 60
+            data["size"]["used"] = 25 + clock["seconds"] // 60
+            return data
+
+    api = ChangingAPI()
+    probe = TimelineProbe()
+    coordinator, store = make_coordinator(api, probe)
+    assert coordinator.update_interval == timedelta(seconds=60)
+    sensor = MyCloudDiskTempSensor(coordinator, {}, "test", "Disk", {"name": "1"})
+    records = {}
+    interval = int(coordinator.update_interval.total_seconds())
+    for seconds in range(0, 481, interval):
+        clock["seconds"] = seconds
+        coordinator.data = await coordinator._async_update_data()
+        records[seconds] = (
+            sensor.native_value, sensor.extra_state_attributes["last_successful_update"],
+            api.calls.count("system_info"),
+        )
+
+    assert probe.checks == 9
+    assert records[60] == records[0]  # Standby: cache and timestamp unchanged.
+    assert records[120][0] == 33  # Short wake phase between the old 600s ticks.
+    assert records[120][1] != records[0][1]
+    assert records[120][2] == 2
+    assert records[180] == records[120]  # Continuing active cannot poll again.
+    assert records[240] == records[120]  # Unknown cannot call the API.
+    assert records[300][2] == 3
+    assert records[360] == records[300]  # SSH error arms, but does not poll.
+    assert records[420][0] == 38
+    assert records[420][2] == 4
+    assert records[480] == records[420]
+    assert coordinator.data["system_info"]["size"]["used"] == 32
+    assert len(store.saved) == 4
+    for endpoint in SAMPLE_DATA:
+        assert api.calls.count(endpoint) == 4

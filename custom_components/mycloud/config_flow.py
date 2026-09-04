@@ -13,17 +13,20 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_DRIVE_DEVICES,
+    CONF_POWER_PROBE_INTERVAL,
     CONF_SLEEP_AWARE_ENABLED,
     CONF_SSH_PASSWORD,
     CONF_SSH_PORT,
     CONF_SSH_USERNAME,
     CONF_UPDATE_INTERVAL,
     DEFAULT_DRIVE_DEVICES,
+    DEFAULT_POWER_PROBE_INTERVAL,
     DEFAULT_SSH_PORT,
     DEFAULT_SSH_USERNAME,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     HOST,
+    MIN_POWER_PROBE_INTERVAL,
     PASSWORD,
     USERNAME,
     VERSION,
@@ -46,6 +49,7 @@ class MyCloudOptionsFlowHandler(config_entries.OptionsFlow):
         current = dict(self.config_entry.options)
         if user_input is not None:
             current.update(user_input)
+            current.setdefault(CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL)
             try:
                 current[CONF_DRIVE_DEVICES] = _validate_drive_devices(
                     current.get(CONF_DRIVE_DEVICES, DEFAULT_DRIVE_DEVICES)
@@ -59,6 +63,12 @@ class MyCloudOptionsFlowHandler(config_entries.OptionsFlow):
 
         options_schema = vol.Schema(
             {
+                vol.Optional(
+                    CONF_POWER_PROBE_INTERVAL,
+                    default=current.get(
+                        CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL
+                    ),
+                ): vol.All(vol.Coerce(int), vol.Range(min=MIN_POWER_PROBE_INTERVAL)),
                 vol.Optional(
                     CONF_UPDATE_INTERVAL,
                     default=current.get(
@@ -112,6 +122,7 @@ class MyCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input=None):
         errors = {}
         current = dict(user_input or {})
+        current.setdefault(CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL)
         if user_input is not None:
             try:
                 current[CONF_DRIVE_DEVICES] = _validate_drive_devices(
@@ -130,6 +141,7 @@ class MyCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     key: current[key]
                     for key in (
                         CONF_UPDATE_INTERVAL,
+                        CONF_POWER_PROBE_INTERVAL,
                         CONF_SLEEP_AWARE_ENABLED,
                         CONF_SSH_PORT,
                         CONF_SSH_USERNAME,
@@ -143,6 +155,12 @@ class MyCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
+                vol.Optional(
+                    CONF_POWER_PROBE_INTERVAL,
+                    default=current.get(
+                        CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL
+                    ),
+                ): vol.All(vol.Coerce(int), vol.Range(min=MIN_POWER_PROBE_INTERVAL)),
                 vol.Required(HOST, default=current.get(HOST, vol.UNDEFINED)): str,
                 vol.Required(USERNAME, default=current.get(USERNAME, vol.UNDEFINED)): str,
                 vol.Required(

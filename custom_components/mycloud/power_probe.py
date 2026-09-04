@@ -127,7 +127,10 @@ class SSHPowerStateClient:
                     username=self._username,
                     password=self._password,
                     client_keys=None,
-                    known_hosts=b"",
+                    # b"" can fall back to ~/.ssh/known_hosts and bypass our pin
+                    # callback. None disables checking. A truthy empty store
+                    # always delegates host-key trust to the pinned client.
+                    known_hosts=asyncssh.import_known_hosts(""),
                     server_host_key_algs="default",
                     client_factory=lambda: validator,
                 ),

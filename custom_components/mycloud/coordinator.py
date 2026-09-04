@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .const import DEFAULT_POWER_PROBE_INTERVAL
 from .power_probe import (
     POWER_ACTIVE,
     POWER_UNKNOWN,
@@ -48,13 +49,16 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         config_entry=None,
         cached_envelope: dict[str, Any] | None = None,
         power_client: SSHPowerStateClient | None = None,
+        power_probe_interval: timedelta = timedelta(seconds=DEFAULT_POWER_PROBE_INTERVAL),
     ) -> None:
+        # The scheduler checks power independently of the legacy API interval.
+        # The wake-phase gate below remains the only authority for API access.
         super().__init__(
             hass,
             logger,
             config_entry=config_entry,
             name="mycloud_coordinator",
-            update_interval=update_interval,
+            update_interval=power_probe_interval if power_client is not None else update_interval,
             update_method=self._async_update_data,
         )
         envelope = cached_envelope or {}
@@ -70,6 +74,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._api_client = api_client
         self._integration_logger = logger
         self._api_started = False
+        self._api_needs_login = False
         self._store = store
         self.power_client = power_client
         self.drive_devices = power_client.drive_devices if power_client else ()
@@ -126,9 +131,17 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_fetch_with_reauth(self) -> dict[str, Any]:
         try:
+            if self._api_needs_login:
+                await self._api_client.login()
+                self._api_needs_login = False
             return await self._async_fetch_once()
         except Exception as err:
             if not _is_http_403(err):
+                raise
+            if self.power_client is not None:
+                # Defer reauthentication until a new observed wake phase.
+                # Even a 403 must not cause a second snapshot attempt now.
+                self._api_needs_login = True
                 raise
 
         await self._api_client.login()

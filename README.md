@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.1` (manifest version `1.3.1`) or select `main` when testing current development changes.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.2` (manifest version `1.3.2`) or select `main` when testing current development changes.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -46,6 +46,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 Sleep-aware polling is disabled by default, so existing installations continue to use the WD API normally. It can be enabled during a new integration setup or later in the integration's **Configure** dialog. Set:
 
 - **Enable sleep-aware polling**: enabled
+- **Disk power probe interval**: `60` seconds by default (minimum `10`)
 - **SSH port**: `22` (default)
 - **SSH username**: `root` on the tested My Cloud EX2 Ultra
 - **SSH password**: the corresponding SSH password
@@ -55,7 +56,7 @@ The feature requires SSH to be enabled on the NAS, `/usr/bin/hdparm` to be prese
 
 Both setup and options forms show drive devices as a serializable text field. On submission, paths are trimmed, validated, and stored in canonical comma-separated form. Invalid input displays an error at the drive-devices field; no settings are saved. Validation applies even when sleep-aware polling is disabled, and the SSH client independently validates device paths before constructing any commands.
 
-Each polling cycle runs only `/usr/bin/hdparm -C` sequentially for the configured drives. The WD API is contacted **once per observed wake phase**, and only when **every** drive reports `active/idle`:
+In sleep-aware mode, the coordinator runs on the separate `power_probe_interval` (default 60 seconds), including for existing entries without this option. The old `update_interval` (default 600 seconds) applies only when sleep-aware polling is disabled; it cannot slow down power checks. Each power check runs only `/usr/bin/hdparm -C` sequentially for the configured drives. The WD API is contacted **once per observed wake phase**, and only when **every** drive reports `active/idle`:
 
 - At startup, one full poll is pending, whether or not a stored snapshot exists.
 - The first all-active check performs that full poll (system info, system status, device info, and firmware version).
@@ -63,13 +64,19 @@ Each polling cycle runs only `/usr/bin/hdparm -C` sequentially for the configure
 - A `standby`, `unknown`, malformed response, timeout, SSH failure, host-key mismatch, or mixed active/standby result blocks all WD API access and arms one full poll for the next all-active check.
 - The wake-phase state is not persisted. After a Home Assistant restart, already-awake disks may be queried once again.
 
-This avoids repeatedly resetting a 10-minute NAS standby timer with a 600-second API polling interval. A sleep/wake transition must actually be observed by a power check to arm another poll. There are no periodic WD API refreshes during a continuous observed wake phase. An API failure also consumes that phase's attempt; the existing single HTTP-403 reauthentication retry is bounded within that attempt. Subsequent checks retain cached values (or report no available cache) until another phase or restart. The integration never calls `smartctl` and does not use `/tmp/standby`.
+This avoids repeatedly resetting a 10-minute NAS standby timer with a 600-second API polling interval. A sleep/wake transition must actually be observed by a power check to arm another poll. There are no periodic WD API refreshes during a continuous observed wake phase. An API failure also consumes that phase's attempt, including HTTP 403: reauthentication is deferred until the next observed wake phase. Only legacy mode retains its single immediate HTTP-403 retry. Subsequent checks retain cached values (or report no available cache) until another phase or restart. The integration never calls `smartctl` and does not use `/tmp/standby`.
+
+The shorter probe interval catches phases the old 600-second cadence missed. It cannot guarantee detection of a complete sleep/wake cycle occurring between two checks; both a blocking state and the following all-active state must be observed. Reduce the power probe interval if necessary, accounting for SSH overhead and response time.
 
 After a successful full refresh, the four WD API results are saved in Home Assistant storage. Whenever no API refresh is performed (including later all-active checks), temperature, storage, health, and volume entities retain that last successful snapshot and expose `data_stale: true` plus the unchanged `last_successful_update`. Disk Sleeping entities use the live `hdparm` result: `standby` is on, `active/idle` is off, and an unknown/error result is unavailable. The power check itself does not rewrite the cache on every interval.
 
 On the first setup there is no snapshot to retain. Enable sleep-aware mode only when the NAS disks are already awake and allow one successful refresh. If the disks are sleeping or their state is unknown, setup stops with a message asking you to wake them; it does not silently call the WD API. There is no automatic force refresh.
 
+Physical disk entities in sleep-aware mode match API names exactly to the basename of validated device paths: `sda` to `/dev/sda`, `sdc` to `/dev/sdc`. API and configuration order do not matter. Unconfigured or orphan API rows such as `sdb` are skipped for all physical disk sensors. Existing registry entries for orphan disks may remain unavailable after upgrading; they are not automatically deleted. SSH commands use only the independently validated configured paths, never API names.
+
 The first successful SSH connection uses trust on first use (TOFU): Home Assistant stores the server's SHA-256 host-key fingerprint and requires the same key on later connections. If the NAS host key legitimately changes, verify the new key independently and re-create the integration to establish a new trust record.
+
+AsyncSSH receives an explicit empty known-hosts object, not empty bytes or `None`. This prevents fallback to ambient `~/.ssh/known_hosts` while keeping the integration's TOFU/pin-verification callback mandatory.
 
 > [!WARNING]
 > SSH credentials grant powerful access, especially when using `root`. Home Assistant stores the configured password, and backups may contain it. Use a dedicated/restricted SSH account where the NAS supports one, protect Home Assistant and its backups, and never reuse this password elsewhere.
@@ -81,6 +88,8 @@ The first successful SSH connection uses trust on first use (TOFU): Home Assista
 ### Tests
 
 With Python 3.12, install `requirements-test.txt`, then run `python -m pytest -q` and `python -m ruff check .`. Config/options tests serialize their actual Voluptuous schemas with the real `voluptuous_serialize.convert` implementation and reproduce the former free-function-validator failure as a negative control. Only the surrounding Home Assistant lifecycle/password-selector interfaces are stubbed; schema serialization and drive-path parsing are not. GitHub Actions also runs these regression tests, HACS validation, and Hassfest.
+
+Wake-phase regressions exercise the real coordinator on a deterministic virtual timeline using its configured interval; NAS API responses and the Home Assistant scheduler interface are isolated. Platform tests execute the actual setup and sensor classes with reordered/orphan disks. Local loopback AsyncSSH server tests perform real handshakes with ephemeral keys to verify TOFU, pinned reconnects, and rejection of mismatches even when an ambient known-hosts file trusts the presented key.
 
 ### Devices
 

@@ -64,6 +64,8 @@ class DataUpdateCoordinator:
         self.hass = hass
         self.data = None
         self.update_method = kwargs.get("update_method")
+        self.update_interval = kwargs.get("update_interval")
+        self.last_update_success = True
 
     async def async_config_entry_first_refresh(self):
         self.data = await self.update_method()

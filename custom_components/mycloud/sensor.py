@@ -19,12 +19,14 @@ from .const import (
     CACHE_STORE_KEY,
     CACHE_STORE_VERSION,
     CONF_DRIVE_DEVICES,
+    CONF_POWER_PROBE_INTERVAL,
     CONF_SLEEP_AWARE_ENABLED,
     CONF_SSH_PASSWORD,
     CONF_SSH_PORT,
     CONF_SSH_USERNAME,
     CONF_UPDATE_INTERVAL,
     DEFAULT_DRIVE_DEVICES,
+    DEFAULT_POWER_PROBE_INTERVAL,
     DEFAULT_SSH_PORT,
     DEFAULT_SSH_USERNAME,
     DEFAULT_UPDATE_INTERVAL,
@@ -96,6 +98,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         config_entry=config_entry,
         cached_envelope=cached_envelope,
         power_client=power_client,
+        power_probe_interval=timedelta(seconds=config_entry.options.get(
+            CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL
+        )),
     )
     hass.data[DOMAIN][config_entry.entry_id].update(
         {"coordinator": coordinator, "async_close": coordinator.async_shutdown}
@@ -130,7 +135,19 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     ]
 
     disks = coordinator.data["system_info"]["disks"]
-    for disk_index, disk in enumerate(disks):
+    # Only validated configuration contributes command paths. API names are
+    # untrusted identifiers and must match a configured basename exactly.
+    configured_drives = {
+        path.rsplit("/", 1)[-1]: path for path in coordinator.drive_devices
+    }
+    for disk in disks:
+        api_name = disk.get("name")
+        drive_device = (
+            configured_drives.get(api_name) if isinstance(api_name, str) else None
+        )
+        if power_client is not None and drive_device is None:
+            _LOGGER.debug("Ignoring API disk not present in configured drive devices")
+            continue
         disk_serial = disk["sn"]
         disk_name = f"{device_name} Disk {disk['name']}"
         disk_model = disk["model"]
@@ -154,9 +171,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 disk_serial,
                 disk_name,
                 disk,
-                coordinator.drive_devices[disk_index]
-                if disk_index < len(coordinator.drive_devices)
-                else None,
+                drive_device,
             ),
             MyCloudDiskFailedSensor(coordinator, disk_device, disk_serial, disk_name, disk),
             MyCloudDiskOverTempSensor(coordinator, disk_device, disk_serial, disk_name, disk),

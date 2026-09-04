@@ -19,6 +19,7 @@ from custom_components.mycloud.config_flow import (
 )
 from custom_components.mycloud.const import (
     CONF_DRIVE_DEVICES,
+    CONF_POWER_PROBE_INTERVAL,
     CONF_SLEEP_AWARE_ENABLED,
     CONF_SSH_PASSWORD,
     CONF_SSH_PORT,
@@ -57,6 +58,7 @@ async def test_initial_flow_stores_sleep_aware_settings_as_options():
     }
     assert result["options"][CONF_SLEEP_AWARE_ENABLED] is True
     assert result["options"][CONF_DRIVE_DEVICES] == "/dev/sda,/dev/sdc"
+    assert result["options"][CONF_POWER_PROBE_INTERVAL] == 60
 
 
 def make_flow(kind):
@@ -102,6 +104,25 @@ async def test_form_serializes_with_real_voluptuous_serialize(kind):
     serialized = json.loads(json.dumps(serialized))
     drive_field = next(item for item in serialized if item["name"] == CONF_DRIVE_DEVICES)
     assert drive_field["type"] == "string"
+    probe_field = next(item for item in serialized if item["name"] == CONF_POWER_PROBE_INTERVAL)
+    assert probe_field["default"] == 60
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["config", "options"])
+@pytest.mark.parametrize("interval", [10, 30, 60])
+async def test_probe_interval_is_validated_and_saved_independently(kind, interval):
+    _, step = make_flow(kind)
+    form = await step()
+    data = submitted_data(kind, "/dev/sda,/dev/sdc")
+    data[CONF_POWER_PROBE_INTERVAL] = str(interval)
+    result = await step(form["data_schema"](data))
+    saved = result["options"] if kind == "config" else result["data"]
+    assert saved[CONF_POWER_PROBE_INTERVAL] == interval
+    assert saved[CONF_UPDATE_INTERVAL] == 600
+    data[CONF_POWER_PROBE_INTERVAL] = 9
+    with pytest.raises(vol.Invalid):
+        form["data_schema"](data)
 
 
 @pytest.mark.asyncio
