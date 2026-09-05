@@ -11,7 +11,7 @@ from typing import Any
 
 import asyncssh
 
-from .probe_diagnostics import PowerProbeError
+from .probe_diagnostics import PowerProbeError, describe_probe_error
 
 HDPARM_PATH = "/usr/bin/hdparm"
 POWER_ACTIVE = "active/idle"
@@ -95,6 +95,7 @@ class SSHPowerStateClient:
         self._observed_fingerprint: str | None = None
         self._timeout = timeout
         self._connection: Any | None = None
+        self._probe_lock = asyncio.Lock()
 
     @property
     def fingerprint(self) -> str | None:
@@ -149,7 +150,7 @@ class SSHPowerStateClient:
 
         return self._connection
 
-    async def async_check(self) -> dict[str, str]:
+    async def _async_check_once(self) -> dict[str, str]:
         """Read every configured drive state sequentially without other commands."""
         connection = await self._async_connect()
         states: dict[str, str] = {}
@@ -185,6 +186,18 @@ class SSHPowerStateClient:
             ) from err
 
         return states
+
+    async def async_check(self) -> dict[str, str]:
+        """Serialize probes and reconnect once after a connection-level failure."""
+        async with self._probe_lock:
+            try:
+                return await self._async_check_once()
+            except PowerProbeError as err:
+                if describe_probe_error(err).error_type != "connection_failed":
+                    raise
+                # _async_check_once() has already discarded the failed connection.
+                # One retry is bounded by the same per-operation timeouts.
+                return await self._async_check_once()
 
     async def async_close(self) -> None:
         """Close the current SSH connection, if any."""

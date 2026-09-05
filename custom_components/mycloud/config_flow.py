@@ -114,6 +114,8 @@ class MyCloudOptionsFlowHandler(config_entries.OptionsFlow):
 class MyCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Configure the WD API connection."""
 
+    VERSION = 2
+
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):

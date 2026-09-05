@@ -58,7 +58,7 @@ async def test_initial_flow_stores_sleep_aware_settings_as_options():
     }
     assert result["options"][CONF_SLEEP_AWARE_ENABLED] is True
     assert result["options"][CONF_DRIVE_DEVICES] == "/dev/sda,/dev/sdc"
-    assert result["options"][CONF_POWER_PROBE_INTERVAL] == 60
+    assert result["options"][CONF_POWER_PROBE_INTERVAL] == 10
 
 
 def make_flow(kind):
@@ -105,7 +105,7 @@ async def test_form_serializes_with_real_voluptuous_serialize(kind):
     drive_field = next(item for item in serialized if item["name"] == CONF_DRIVE_DEVICES)
     assert drive_field["type"] == "string"
     probe_field = next(item for item in serialized if item["name"] == CONF_POWER_PROBE_INTERVAL)
-    assert probe_field["default"] == 60
+    assert probe_field["default"] == 10
 
 
 @pytest.mark.asyncio

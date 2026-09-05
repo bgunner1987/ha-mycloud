@@ -199,6 +199,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         ])
 
     async_add_entities(sensors_to_add)
+    coordinator.async_start_power_probe_loop()
 
 class MyCloudCachedEntity(CoordinatorEntity):
     """Expose cache freshness without changing entity identity or value."""
@@ -411,6 +412,8 @@ class MyCloudDiskSleepSensor(MyCloudCachedEntity, BinarySensorEntity):
         if self.coordinator.data.get("sleep_aware_enabled"):
             return (
                 self._drive_device is not None
+                and self.coordinator.power_probe_status not in ("error", "unknown")
+                and POWER_UNKNOWN not in power_states.values()
                 and power_states.get(self._drive_device) != POWER_UNKNOWN
                 and self._drive_device in power_states
                 and super().available

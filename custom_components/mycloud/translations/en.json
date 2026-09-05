@@ -2,13 +2,13 @@
     "config": {
         "step": {
             "user": {
-                "description": "Configure access to the WD My Cloud API. Optional sleep-aware polling checks every disk over SSH and performs one full API poll per observed wake phase. Further active checks use cached values. Power checks default to 60 seconds. The minimum legacy API interval is {minimum_interval} seconds.",
+                "description": "Configure access to the WD My Cloud API. Optional sleep-aware polling checks every disk over SSH and performs full API polls only for a confirmed wake phase or when the API interval is due. Power checks default to 10 seconds. The minimum API interval is {minimum_interval} seconds.",
                 "data": {
                     "Host": "Host",
                     "Username": "Username",
                     "Password": "Password",
                     "Version": "My Cloud OS version",
-                    "update_interval": "Legacy API interval (seconds)",
+                    "update_interval": "API update interval (seconds)",
                     "power_probe_interval": "Disk power probe interval (seconds)",
                     "sleep_aware_enabled": "Enable sleep-aware polling",
                     "ssh_port": "SSH port",
@@ -17,8 +17,8 @@
                     "drive_devices": "Drive devices"
                 },
                 "data_description": {
-                    "update_interval": "Used only when sleep-aware polling is disabled. Does not control disk power checks.",
-                    "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default 60 seconds, minimum 10. Does not cause periodic WD API refreshes.",
+                    "update_interval": "Legacy polling interval, and the minimum spacing for periodic full API snapshots in sleep-aware mode. Does not control disk power checks.",
+                    "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default and minimum 10 seconds.",
                     "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Leave disabled for legacy behavior. Unknown states always block WD API polling when enabled.",
                     "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
                     "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."
@@ -39,9 +39,9 @@
         "step": {
             "init": {
                 "title": "Polling options",
-                "description": "Sleep-aware polling checks every configured drive with hdparm and performs one full WD API poll per observed wake phase. Further active checks use cached values until a non-active state is observed. Power checks default to 60 seconds. The minimum legacy API interval is {minimum_interval} seconds.",
+                "description": "Sleep-aware polling checks every configured drive with hdparm and performs full API polls only for a confirmed wake phase or when the API interval is due. Power checks default to 10 seconds. The minimum API interval is {minimum_interval} seconds.",
                 "data": {
-                    "update_interval": "Legacy API interval (seconds)",
+                    "update_interval": "API update interval (seconds)",
                     "power_probe_interval": "Disk power probe interval (seconds)",
                     "sleep_aware_enabled": "Enable sleep-aware polling",
                     "ssh_port": "SSH port",
@@ -50,8 +50,8 @@
                     "drive_devices": "Drive devices"
                 },
                 "data_description": {
-                    "update_interval": "Used only when sleep-aware polling is disabled. Does not control disk power checks.",
-                    "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default 60 seconds, minimum 10. Does not cause periodic WD API refreshes.",
+                    "update_interval": "Legacy polling interval, and the minimum spacing for periodic full API snapshots in sleep-aware mode. Does not control disk power checks.",
+                    "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default and minimum 10 seconds.",
                     "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Unknown states always block WD API polling.",
                     "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
                     "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."

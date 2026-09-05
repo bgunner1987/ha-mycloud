@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -319,3 +320,74 @@ async def test_real_asyncssh_algorithm_negotiation_failure_is_classified(monkeyp
         await client.async_close()
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_probe_lock_prevents_overlapping_commands():
+    active = 0
+    maximum = 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowConnection(FakeConnection):
+        async def run(self, command, check=False):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            entered.set()
+            await release.wait()
+            active -= 1
+            return SimpleNamespace(
+                exit_status=0, stdout="drive state is: active/idle", stderr=""
+            )
+
+    client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
+    client._connection = SlowConnection([])
+    first = asyncio.create_task(client.async_check())
+    await entered.wait()
+    second = asyncio.create_task(client.async_check())
+    await asyncio.sleep(0)
+    assert maximum == 1
+    release.set()
+    await first
+    await second
+    assert maximum == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_gets_only_one_controlled_reconnect(monkeypatch):
+    attempts = 0
+
+    async def fail_connect(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise ConnectionRefusedError("synthetic-private-detail")
+
+    monkeypatch.setattr(asyncssh, "connect", fail_connect)
+    client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
+    with pytest.raises(PowerProbeError):
+        await client.async_check()
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_authentication_and_host_key_failures_are_not_retried(monkeypatch):
+    for cause in (
+        asyncssh.PermissionDenied("synthetic-private-detail"),
+        asyncssh.HostKeyNotVerifiable("synthetic-private-detail"),
+    ):
+        attempts = 0
+        current_cause = cause
+
+        async def fail_connect(*args, error=current_cause, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise error
+
+        monkeypatch.setattr(asyncssh, "connect", fail_connect)
+        client = SSHPowerStateClient(
+            "nas", 22, "test", "unused-test-value", ("/dev/sda",)
+        )
+        with pytest.raises(PowerProbeError):
+            await client.async_check()
+        assert attempts == 1

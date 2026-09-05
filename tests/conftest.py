@@ -66,12 +66,23 @@ class DataUpdateCoordinator:
         self.update_method = kwargs.get("update_method")
         self.update_interval = kwargs.get("update_interval")
         self.last_update_success = True
+        self.updated_data_calls = 0
+        self.update_error_calls = 0
 
     async def async_config_entry_first_refresh(self):
         self.data = await self.update_method()
 
     async def async_shutdown(self):
         pass
+
+    def async_set_updated_data(self, data):
+        self.data = data
+        self.last_update_success = True
+        self.updated_data_calls += 1
+
+    def async_set_update_error(self, error):
+        self.last_update_success = False
+        self.update_error_calls += 1
 
 
 config_entries.ConfigEntry = ConfigEntry

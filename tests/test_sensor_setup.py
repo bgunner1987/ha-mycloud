@@ -90,7 +90,7 @@ async def test_platform_matches_exact_names_not_positions(monkeypatch, names, de
         CONF_UPDATE_INTERVAL: 600,
     })
     try:
-        assert coordinator.update_interval == timedelta(seconds=60)
+        assert coordinator.update_interval is None
         sleeping = {e._disk_name: e for e in entities if isinstance(e, platform.MyCloudDiskSleepSensor)}
         assert set(sleeping) == {"sda", "sdc"}
         assert sleeping["sda"]._drive_device == "/dev/sda"
@@ -121,7 +121,7 @@ async def test_unconfigured_or_untrusted_api_name_never_maps_to_a_drive(monkeypa
         CONF_UPDATE_INTERVAL: 600, CONF_POWER_PROBE_INTERVAL: 30,
     })
     try:
-        assert coordinator.update_interval == timedelta(seconds=30)
+        assert coordinator.update_interval is None
         disk_entities = [e for e in entities if hasattr(e, "_disk_name")]
         assert len(disk_entities) == 12
         assert {e._disk_name for e in disk_entities} == {"sda", "sdc"}

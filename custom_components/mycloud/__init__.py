@@ -5,10 +5,29 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import (
+    CONF_POWER_PROBE_INTERVAL,
+    DEFAULT_POWER_PROBE_INTERVAL,
+    DOMAIN,
+    LEGACY_DEFAULT_POWER_PROBE_INTERVAL,
+)
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["sensor"]
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Move the formerly stored 60-second default to the v2 default once."""
+    if entry.version >= 2:
+        return True
+    options = dict(entry.options)
+    if (
+        options.get(CONF_POWER_PROBE_INTERVAL)
+        == LEGACY_DEFAULT_POWER_PROBE_INTERVAL
+    ):
+        options[CONF_POWER_PROBE_INTERVAL] = DEFAULT_POWER_PROBE_INTERVAL
+    hass.config_entries.async_update_entry(entry, options=options, version=2)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

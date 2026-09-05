@@ -113,6 +113,10 @@ class FakeProbe:
         self.closed += 1
 
 
+async def no_sleep(_delay):
+    """Advance retry state without wall-clock sleeps."""
+
+
 def make_coordinator(api, probe=None, with_cache=True):
     envelope = (
         {
@@ -133,6 +137,7 @@ def make_coordinator(api, probe=None, with_cache=True):
         config_entry=object(),
         cached_envelope=envelope,
         power_client=probe,
+        sleep_func=no_sleep,
     )
     return coordinator, store
 
@@ -311,7 +316,7 @@ async def test_continuous_all_active_polls_api_only_once(with_cache):
         assert api.calls == calls_after_first
         assert len(store.saved) == saves_after_first
         assert result["last_full_update"] == first["last_full_update"]
-        assert result["data_stale"] is True
+        assert result["data_stale"] is False
         assert result["power_states"] == ALL_ACTIVE
         for key in SAMPLE_DATA:
             assert result[key] == first[key]
@@ -351,15 +356,16 @@ async def test_blocked_probe_rearms_exactly_one_full_wake_poll(blocked_states):
     assert awake["data_stale"] is False
     assert api.calls.count("enter") == 1
     assert api.calls.count("login") == 0
+    expected_polls = 2 if POWER_STANDBY in (blocked_states or {}).values() else 1
     for endpoint in SAMPLE_DATA:
-        assert api.calls.count(endpoint) == 2
-    assert len(store.saved) == saves_after_first + 1
+        assert api.calls.count(endpoint) == expected_polls
+    assert len(store.saved) == saves_after_first + int(expected_polls == 2)
 
     for _ in range(3):
         cached = await coordinator._async_update_data()
         assert cached["last_full_update"] == awake["last_full_update"]
         for endpoint in SAMPLE_DATA:
-            assert api.calls.count(endpoint) == 2
+            assert api.calls.count(endpoint) == expected_polls
             assert cached[endpoint] == awake[endpoint]
 
 
@@ -402,7 +408,7 @@ async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cac
             for key, value in SAMPLE_DATA.items():
                 assert result[key] == value
         else:
-            with pytest.raises(UpdateFailed, match="poll for this wake phase failed"):
+            with pytest.raises(UpdateFailed, match="configured API interval"):
                 await coordinator._async_update_data()
         assert api.calls.count("system_info") == 1
         assert api.calls.count("login") == 0
@@ -414,6 +420,13 @@ async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cac
         with pytest.raises(UpdateFailed, match="Wake the NAS disks once"):
             await coordinator._async_update_data()
     probe.states = ALL_ACTIVE
+    if with_cache:
+        await coordinator._async_update_data()
+    else:
+        with pytest.raises(UpdateFailed, match="configured API interval"):
+            await coordinator._async_update_data()
+    assert api.calls.count("system_info") == 1
+    coordinator._last_api_attempt_at = "2020-01-01T00:00:00+00:00"
     await coordinator._async_update_data()
     assert api.calls.count("system_info") == 2
     assert api.calls.count("login") == int(isinstance(failure, ForbiddenError))
@@ -438,7 +451,7 @@ async def test_restart_allows_one_new_poll_with_persisted_snapshot():
     fresh = await restarted._async_update_data()
     cached = await restarted._async_update_data()
     assert fresh["data_stale"] is False
-    assert cached["data_stale"] is True
+    assert cached["data_stale"] is False
     assert restarted._api_client.calls.count("system_info") == 1
 
 
@@ -464,7 +477,9 @@ def test_coordinator_scheduler_uses_probe_interval_only_in_sleep_aware_mode(
         power_client=FakeProbe(ALL_ACTIVE) if sleep_aware else None,
         power_probe_interval=timedelta(seconds=probe_seconds),
     )
-    assert coordinator.update_interval == timedelta(seconds=expected_seconds)
+    assert coordinator.update_interval == (
+        None if sleep_aware else timedelta(seconds=expected_seconds)
+    )
 
 
 @pytest.mark.asyncio
@@ -502,10 +517,10 @@ async def test_fast_probe_observes_short_phases_and_refreshes_values_and_timesta
     api = ChangingAPI()
     probe = TimelineProbe()
     coordinator, store = make_coordinator(api, probe)
-    assert coordinator.update_interval == timedelta(seconds=60)
+    assert coordinator.update_interval is None
     sensor = MyCloudDiskTempSensor(coordinator, {}, "test", "Disk", {"name": "1"})
     records = {}
-    interval = int(coordinator.update_interval.total_seconds())
+    interval = 60
     for seconds in range(0, 481, interval):
         clock["seconds"] = seconds
         coordinator.data = await coordinator._async_update_data()
@@ -514,19 +529,18 @@ async def test_fast_probe_observes_short_phases_and_refreshes_values_and_timesta
             api.calls.count("system_info"),
         )
 
-    assert probe.checks == 9
+    assert probe.checks == 11  # Two bounded follow-ups for the unknown result.
     assert records[60] == records[0]  # Standby: cache and timestamp unchanged.
     assert records[120][0] == 33  # Short wake phase between the old 600s ticks.
     assert records[120][1] != records[0][1]
     assert records[120][2] == 2
     assert records[180] == records[120]  # Continuing active cannot poll again.
     assert records[240] == records[120]  # Unknown cannot call the API.
-    assert records[300][2] == 3
-    assert records[360] == records[300]  # SSH error arms, but does not poll.
-    assert records[420][0] == 38
-    assert records[420][2] == 4
+    assert records[300] == records[120]  # Unknown did not rearm this wake phase.
+    assert records[360] == records[300]  # SSH errors remain fail-closed.
+    assert records[420] == records[300]
     assert records[480] == records[420]
-    assert coordinator.data["system_info"]["size"]["used"] == 32
-    assert len(store.saved) == 4
+    assert coordinator.data["system_info"]["size"]["used"] == 27
+    assert len(store.saved) == 2
     for endpoint in SAMPLE_DATA:
-        assert api.calls.count(endpoint) == 4
+        assert api.calls.count(endpoint) == 2
