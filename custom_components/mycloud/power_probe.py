@@ -73,7 +73,7 @@ class _PinnedSSHClient(asyncssh.SSHClient):
 
 
 class SSHPowerStateClient:
-    """Maintain and supervise one SSH connection used only for hdparm -C."""
+    """Use one short-lived SSH connection per serialized hdparm probe."""
 
     def __init__(
         self,
@@ -111,16 +111,13 @@ class SSHPowerStateClient:
         self._observed_fingerprint = fingerprint
 
     async def _async_connect(self):
-        if self._connection is not None and not self._connection.is_closed():
-            return self._connection
-
         validator = _PinnedSSHClient(
             self._expected_fingerprint,
             self._fingerprint_seen,
         )
         self._observed_fingerprint = None
         try:
-            self._connection = await asyncio.wait_for(
+            connection = await asyncio.wait_for(
                 asyncssh.connect(
                     self._host,
                     port=self._port,
@@ -137,25 +134,25 @@ class SSHPowerStateClient:
                 timeout=self._timeout,
             )
         except Exception as err:
-            with suppress(Exception):
-                await self.async_close()
             raise PowerProbeError(
                 "SSH connection or host-key validation failed",
                 stage="connect", detail="connect_failed",
             ) from err
 
+        self._connection = connection
+
         if self._expected_fingerprint is None and self._observed_fingerprint:
             self._fingerprint = self._observed_fingerprint
             self._expected_fingerprint = self._observed_fingerprint
 
-        return self._connection
+        return connection
 
     async def _async_check_once(self) -> dict[str, str]:
         """Read every configured drive state sequentially without other commands."""
-        connection = await self._async_connect()
         states: dict[str, str] = {}
 
         try:
+            connection = await self._async_connect()
             for device in self._drive_devices:
                 result = await asyncio.wait_for(
                     connection.run(f"{HDPARM_PATH} -C {device}", check=False),
@@ -174,16 +171,23 @@ class SSHPowerStateClient:
                         error_type="parse_failed", detail="unrecognized_hdparm_output",
                     )
                 states[device] = parse_hdparm_state(output)
-        except PowerProbeError:
-            with suppress(Exception):
-                await self.async_close()
+        except (PowerProbeError, asyncio.CancelledError):
             raise
         except Exception as err:
-            with suppress(Exception):
-                await self.async_close()
             raise PowerProbeError(
                 "SSH power-state command failed", stage="command", detail="command_failed",
             ) from err
+        finally:
+            # A successful result is returned only after the connection has been
+            # closed. The same cleanup also covers parser failures and cancellation.
+            with suppress(Exception):
+                close_task = asyncio.create_task(self.async_close())
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    with suppress(asyncio.CancelledError, Exception):
+                        await close_task
+                    raise
 
         return states
 

@@ -12,6 +12,7 @@ from typing import Any
 
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .api_diagnostics import APIFailure, describe_api_error, log_api_failure
 from .const import DEFAULT_POWER_PROBE_INTERVAL
 from .power_probe import (
     POWER_ACTIVE,
@@ -71,6 +72,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         power_client: SSHPowerStateClient | None = None,
         power_probe_interval: timedelta = timedelta(seconds=DEFAULT_POWER_PROBE_INTERVAL),
         *,
+        api_client_factory: Callable[[], Any] | None = None,
         probe_retry_delays: tuple[float, ...] = _DEFAULT_PROBE_RETRY_DELAYS,
         sleep_func: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -96,9 +98,10 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_full_update = envelope.get("last_full_update")
         self._persisted_fingerprint = envelope.get("ssh_host_key")
         self._api_client = api_client
+        self._api_client_factory = api_client_factory
+        self._active_api_client = None
         self._integration_logger = logger
         self._api_started = False
-        self._api_needs_login = False
         self._store = store
         self._api_update_interval = update_interval
         self._power_probe_interval = power_probe_interval
@@ -116,6 +119,10 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._wake_poll_pending = True
         self._last_api_attempt_at: str | None = None
         self._last_api_attempt_failed = False
+        self.last_api_attempt_status = "never"
+        self.last_api_error_type: str | None = None
+        self.last_api_error: str | None = None
+        self._last_logged_api_failure: APIFailure | None = None
         self._cycle_lock = asyncio.Lock()
         self._probe_task: asyncio.Task | None = None
         self._closed = False
@@ -129,6 +136,16 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "power_probe_status": self.power_probe_status,
             "power_probe_error_type": self.power_probe_error_type,
             "last_power_probe_error": self.last_power_probe_error,
+        }
+
+    @property
+    def api_diagnostics(self) -> dict[str, Any]:
+        """Expose only sanitized runtime diagnostics for complete API attempts."""
+        return {
+            "last_api_attempt": self._last_api_attempt_at,
+            "last_api_attempt_status": self.last_api_attempt_status,
+            "last_api_error_type": self.last_api_error_type,
+            "last_api_error": self.last_api_error,
         }
 
     @property
@@ -176,38 +193,69 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
         self._api_started = True
 
-    async def _async_fetch_once(self) -> dict[str, Any]:
+    async def _async_fetch_once(self, api_client) -> dict[str, Any]:
         # Wake-phase polls always refresh the complete snapshot. Legacy mode
         # retains its prior dynamic-only refresh once static data is cached.
         include_static = self.power_client is not None or self._cached_data is None
         result = {
-            "system_info": await self._api_client.system_info(),
-            "system_status": await self._api_client.system_status(),
+            "system_info": await api_client.system_info(),
+            "system_status": await api_client.system_status(),
         }
         if include_static:
-            result["device_info"] = await self._api_client.device_info()
-            result["system_version"] = await self._api_client.system_version()
+            result["device_info"] = await api_client.device_info()
+            result["system_version"] = await api_client.system_version()
         else:
             result["device_info"] = deepcopy(self._cached_data["device_info"])
             result["system_version"] = deepcopy(self._cached_data["system_version"])
         return result
 
-    async def _async_fetch_with_reauth(self) -> dict[str, Any]:
+    async def _async_fetch_with_reauth(self, api_client) -> dict[str, Any]:
         try:
-            if self._api_needs_login:
-                await self._api_client.login()
-                self._api_needs_login = False
-            return await self._async_fetch_once()
+            return await self._async_fetch_once(api_client)
         except Exception as err:
             if not _is_http_403(err):
                 raise
-            if self.power_client is not None:
-                # A failed wake-phase attempt is never repeated immediately.
-                self._api_needs_login = True
-                raise
 
-        await self._api_client.login()
-        return await self._async_fetch_once()
+        # The power gate is already satisfied. Re-authenticate once on this same
+        # opened session, then repeat the complete snapshot exactly once.
+        await api_client.login()
+        return await self._async_fetch_once(api_client)
+
+    async def _async_fetch_short_lived(self) -> dict[str, Any]:
+        """Open one fresh WD client for one complete sleep-aware snapshot."""
+        factory = self._api_client_factory
+        api_client = factory() if factory is not None else self._api_client
+        if api_client is None:
+            raise RuntimeError("WD API client factory returned no client")
+        entered = False
+        self._active_api_client = api_client
+        try:
+            await api_client.__aenter__()
+            entered = True
+            return await self._async_fetch_with_reauth(api_client)
+        finally:
+            try:
+                close_task = asyncio.create_task(
+                    self._async_close_short_api(api_client, entered)
+                )
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    with suppress(asyncio.CancelledError, Exception):
+                        await close_task
+                    raise
+            finally:
+                self._active_api_client = None
+
+    @staticmethod
+    async def _async_close_short_api(api_client, entered: bool) -> None:
+        """Close an entered or partially opened short-lived API client."""
+        if entered:
+            await api_client.__aexit__(None, None, None)
+            return
+        session = getattr(api_client, "session", None)
+        if session is not None and not getattr(session, "closed", False):
+            await session.close()
 
     def _cached_result(self, data_stale: bool) -> dict[str, Any]:
         assert self._cached_data is not None
@@ -220,6 +268,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
         )
         result.update(self.power_probe_diagnostics)
+        result.update(self.api_diagnostics)
         return result
 
     def _diagnostic_signature(self) -> tuple[Any, ...]:
@@ -228,6 +277,9 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.power_probe_status,
             self.power_probe_error_type,
             self.last_power_probe_error,
+            self.last_api_attempt_status,
+            self.last_api_error_type,
+            self.last_api_error,
         )
 
     def _log_probe_transition(self) -> None:
@@ -322,13 +374,27 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_full_poll(self, attempt_time: str) -> dict[str, Any]:
         self._last_api_attempt_at = attempt_time
         try:
-            await self._async_start_api()
-            fresh_data = await self._async_fetch_with_reauth()
-        except Exception as err:
+            if self.power_client is not None:
+                fresh_data = await self._async_fetch_short_lived()
+            else:
+                await self._async_start_api()
+                fresh_data = await self._async_fetch_with_reauth(self._api_client)
+        except Exception as err:  # noqa: BLE001 - third-party API errors are untyped
+            failure = describe_api_error(err)
             self._last_api_attempt_failed = True
-            raise UpdateFailed(f"Error fetching data from the WD API: {err}") from err
+            self.last_api_attempt_status = "error"
+            self.last_api_error_type = failure.error_type
+            self.last_api_error = failure.summary
+            if failure != self._last_logged_api_failure:
+                log_api_failure(self._integration_logger, failure)
+                self._last_logged_api_failure = failure
+            raise UpdateFailed(f"WD API snapshot failed: {failure.summary}") from None
 
         self._last_api_attempt_failed = False
+        self.last_api_attempt_status = "success"
+        self.last_api_error_type = None
+        self.last_api_error = None
+        self._last_logged_api_failure = None
         self._cached_data = fresh_data
         self._last_full_update = _utc_now()
         await self._async_save_cache()

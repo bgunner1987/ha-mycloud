@@ -116,6 +116,44 @@ async def test_permanent_unknown_uses_cache_after_two_followups():
 
 
 @pytest.mark.asyncio
+async def test_no_ssh_connection_is_held_during_followup_waits():
+    class LifecycleProbe(SequenceProbe):
+        connection_open = False
+
+        async def async_check(self):
+            assert not self.connection_open
+            self.connection_open = True
+            try:
+                return await super().async_check()
+            finally:
+                self.connection_open = False
+
+    probe = LifecycleProbe([UNKNOWN, UNKNOWN, ACTIVE])
+    waits = []
+
+    async def assert_closed_while_waiting(delay):
+        assert not probe.connection_open
+        waits.append(delay)
+
+    coordinator = MyCloudDataUpdateCoordinator(
+        hass=object(),
+        logger=logging.getLogger("test"),
+        api_client=FakeAPI(),
+        store=FakeStore(),
+        update_interval=timedelta(seconds=600),
+        power_client=probe,
+        probe_retry_delays=(2, 3),
+        sleep_func=assert_closed_while_waiting,
+    )
+
+    await coordinator._async_update_data()
+
+    assert waits == [2, 3]
+    assert probe.calls == 3
+    assert not probe.connection_open
+
+
+@pytest.mark.asyncio
 async def test_transient_unknown_does_not_rearm_current_wake_phase():
     coordinator, probe, api, _, _ = make_scheduler(
         [ACTIVE, UNKNOWN, UNKNOWN, UNKNOWN, ACTIVE]
@@ -265,6 +303,12 @@ async def test_background_api_failure_keeps_cache_and_cannot_retry_quickly(monke
     assert coordinator.last_update_success
     assert coordinator.data["data_stale"] is True
     assert coordinator.data["last_full_update"] == first_update
+    assert coordinator.data["last_api_attempt"] is not None
+    assert coordinator.data["last_api_attempt_status"] == "error"
+    assert coordinator.data["last_api_error_type"] == "api_error"
+    assert coordinator.data["last_api_error"] == (
+        "api_error; stage=snapshot; details_withheld"
+    )
     assert coordinator.updated_data_calls == 1
     assert len(store.saved) == saves
     assert api.calls.count("system_info") == 2

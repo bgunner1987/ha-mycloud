@@ -54,7 +54,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     password = config_entry.data[PASSWORD]
     version = config_entry.data[VERSION]
 
-    client = nas_client(username, password, host, version)
     update_interval_seconds = config_entry.options.get(
         CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
     )
@@ -68,8 +67,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     )
     cached_envelope = await store.async_load()
 
+    sleep_aware_enabled = config_entry.options.get(CONF_SLEEP_AWARE_ENABLED, False)
     power_client = None
-    if config_entry.options.get(CONF_SLEEP_AWARE_ENABLED, False):
+    if sleep_aware_enabled:
         drive_devices = parse_drive_devices(
             config_entry.options.get(CONF_DRIVE_DEVICES, DEFAULT_DRIVE_DEVICES)
         )
@@ -89,10 +89,21 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             expected_fingerprint=cached_fingerprint,
         )
 
+    # Sleep-aware snapshots use a new HTTP client per permitted full poll. Legacy
+    # mode retains the established long-lived client behavior for compatibility.
+    api_client = None if sleep_aware_enabled else nas_client(
+        username, password, host, version
+    )
+    api_client_factory = (
+        (lambda: nas_client(username, password, host, version))
+        if sleep_aware_enabled
+        else None
+    )
+
     coordinator = MyCloudDataUpdateCoordinator(
         hass,
         _LOGGER,
-        api_client=client,
+        api_client=api_client,
         store=store,
         update_interval=scan_interval,
         config_entry=config_entry,
@@ -101,6 +112,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         power_probe_interval=timedelta(seconds=config_entry.options.get(
             CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL
         )),
+        api_client_factory=api_client_factory,
     )
     hass.data[DOMAIN][config_entry.entry_id].update(
         {"coordinator": coordinator, "async_close": coordinator.async_shutdown}
@@ -210,6 +222,7 @@ class MyCloudCachedEntity(CoordinatorEntity):
             "data_stale": bool(self.coordinator.data.get("data_stale", False)),
             "last_successful_update": self.coordinator.data.get("last_full_update"),
             **self.coordinator.power_probe_diagnostics,
+            **self.coordinator.api_diagnostics,
         }
 
 

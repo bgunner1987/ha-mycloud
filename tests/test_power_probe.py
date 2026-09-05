@@ -64,15 +64,25 @@ class FakeConnection:
         pass
 
 
+def use_connections(monkeypatch, *connections):
+    """Return supplied fake connections from the real connect boundary."""
+    pending = iter(connections)
+
+    async def connect(*args, **kwargs):
+        return next(pending)
+
+    monkeypatch.setattr(asyncssh, "connect", connect)
+
+
 @pytest.mark.asyncio
-async def test_probe_runs_only_fixed_hdparm_commands():
+async def test_probe_runs_only_fixed_hdparm_commands(monkeypatch):
     connection = FakeConnection(
         ["drive state is: standby", "drive state is: active/idle"]
     )
     client = SSHPowerStateClient(
         "nas", 22, "root", "not-a-credential", ("/dev/sda", "/dev/sdc")
     )
-    client._connection = connection
+    use_connections(monkeypatch, connection)
 
     states = await client.async_check()
 
@@ -81,6 +91,8 @@ async def test_probe_runs_only_fixed_hdparm_commands():
         "/usr/bin/hdparm -C /dev/sda",
         "/usr/bin/hdparm -C /dev/sdc",
     ]
+    assert connection.closed
+    assert client._connection is None
 
 
 class LocalSSHServer(asyncssh.SSHServer):
@@ -118,6 +130,7 @@ async def test_real_asyncssh_tofu_then_pinned_reconnect():
         }
         pin = client.fingerprint
         assert pin == key.get_fingerprint("sha256")
+        assert client._connection is None
         await client.async_close()
         # A newly created client simulates using the persisted TOFU pin.
         client = SSHPowerStateClient(
@@ -126,6 +139,7 @@ async def test_real_asyncssh_tofu_then_pinned_reconnect():
         )
         await client.async_check()
         assert client.fingerprint == pin
+        assert client._connection is None
         assert commands == [
             "/usr/bin/hdparm -C /dev/sda", "/usr/bin/hdparm -C /dev/sdc",
         ] * 2
@@ -208,7 +222,9 @@ async def test_connect_preserves_classifiable_cause(monkeypatch, cause, expected
     (1, "drive state is: active/idle", "command_failed"),
     (0, "synthetic-private-detail", "parse_failed"),
 ])
-async def test_command_and_parser_failure_are_classified(exit_status, stdout, expected):
+async def test_command_and_parser_failure_are_classified(
+    monkeypatch, exit_status, stdout, expected
+):
     connection = FakeConnection([])
 
     async def run(*args, **kwargs):
@@ -218,7 +234,7 @@ async def test_command_and_parser_failure_are_classified(exit_status, stdout, ex
 
     connection.run = run
     client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
-    client._connection = connection
+    use_connections(monkeypatch, connection)
     with pytest.raises(PowerProbeError) as error:
         await client.async_check()
     failure = describe_probe_error(error.value)
@@ -231,7 +247,7 @@ async def test_command_and_parser_failure_are_classified(exit_status, stdout, ex
 
 
 @pytest.mark.asyncio
-async def test_command_timeout_is_not_masked_by_cleanup_error():
+async def test_command_timeout_is_not_masked_by_cleanup_error(monkeypatch):
     connection = FakeConnection([])
 
     async def run(*args, **kwargs):
@@ -243,7 +259,7 @@ async def test_command_timeout_is_not_masked_by_cleanup_error():
     connection.run = run
     connection.wait_closed = wait_closed
     client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
-    client._connection = connection
+    use_connections(monkeypatch, connection)
     with pytest.raises(PowerProbeError) as error:
         await client.async_check()
     failure = describe_probe_error(error.value)
@@ -253,11 +269,61 @@ async def test_command_timeout_is_not_masked_by_cleanup_error():
 
 
 @pytest.mark.asyncio
-async def test_explicit_hdparm_unknown_is_not_a_parser_error():
+async def test_explicit_hdparm_unknown_is_not_a_parser_error(monkeypatch):
     connection = FakeConnection(["drive state is: unknown"])
     client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
-    client._connection = connection
+    use_connections(monkeypatch, connection)
     assert await client.async_check() == {"/dev/sda": POWER_UNKNOWN}
+    assert connection.closed
+    assert client._connection is None
+
+
+@pytest.mark.asyncio
+async def test_two_probes_use_two_distinct_short_lived_connections(monkeypatch):
+    connections = [
+        FakeConnection(["drive state is: active/idle"]),
+        FakeConnection(["drive state is: active/idle"]),
+    ]
+    use_connections(monkeypatch, *connections)
+    client = SSHPowerStateClient(
+        "nas", 22, "test", "unused-test-value", ("/dev/sda",)
+    )
+
+    await client.async_check()
+    await client.async_check()
+
+    assert connections[0] is not connections[1]
+    assert all(connection.closed for connection in connections)
+    assert [connection.commands for connection in connections] == [
+        ["/usr/bin/hdparm -C /dev/sda"],
+        ["/usr/bin/hdparm -C /dev/sda"],
+    ]
+    assert client._connection is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_closes_probe_connection(monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    connection = FakeConnection([])
+
+    async def run(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    connection.run = run
+    use_connections(monkeypatch, connection)
+    client = SSHPowerStateClient(
+        "nas", 22, "test", "unused-test-value", ("/dev/sda",)
+    )
+    task = asyncio.create_task(client.async_check())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert connection.closed
+    assert client._connection is None
 
 
 @pytest.mark.asyncio
@@ -323,7 +389,7 @@ async def test_real_asyncssh_algorithm_negotiation_failure_is_classified(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_probe_lock_prevents_overlapping_commands():
+async def test_probe_lock_prevents_overlapping_commands(monkeypatch):
     active = 0
     maximum = 0
     entered = asyncio.Event()
@@ -341,8 +407,9 @@ async def test_probe_lock_prevents_overlapping_commands():
                 exit_status=0, stdout="drive state is: active/idle", stderr=""
             )
 
+    connections = [SlowConnection([]), SlowConnection([])]
+    use_connections(monkeypatch, *connections)
     client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
-    client._connection = SlowConnection([])
     first = asyncio.create_task(client.async_check())
     await entered.wait()
     second = asyncio.create_task(client.async_check())
@@ -352,6 +419,8 @@ async def test_probe_lock_prevents_overlapping_commands():
     await first
     await second
     assert maximum == 1
+    assert all(connection.closed for connection in connections)
+    assert client._connection is None
 
 
 @pytest.mark.asyncio

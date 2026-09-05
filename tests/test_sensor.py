@@ -19,6 +19,12 @@ def make_coordinator(power_state):
     return SimpleNamespace(
         last_update_success=True,
         power_probe_diagnostics={},
+        api_diagnostics={
+            "last_api_attempt": "2026-09-03T08:00:00+00:00",
+            "last_api_attempt_status": "success",
+            "last_api_error_type": None,
+            "last_api_error": None,
+        },
         power_probe_status="unknown" if power_state == POWER_UNKNOWN else "ok",
         data={
             "system_info": {
@@ -67,4 +73,8 @@ def test_cached_temperature_and_freshness_attributes_are_retained():
     assert entity.extra_state_attributes == {
         "data_stale": True,
         "last_successful_update": "2026-09-03T08:00:00+00:00",
+        "last_api_attempt": "2026-09-03T08:00:00+00:00",
+        "last_api_attempt_status": "success",
+        "last_api_error_type": None,
+        "last_api_error": None,
     }

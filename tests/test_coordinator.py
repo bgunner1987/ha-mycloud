@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -117,7 +118,7 @@ async def no_sleep(_delay):
     """Advance retry state without wall-clock sleeps."""
 
 
-def make_coordinator(api, probe=None, with_cache=True):
+def make_coordinator(api, probe=None, with_cache=True, api_factory=None):
     envelope = (
         {
             "data": deepcopy(SAMPLE_DATA),
@@ -137,6 +138,7 @@ def make_coordinator(api, probe=None, with_cache=True):
         config_entry=object(),
         cached_envelope=envelope,
         power_client=probe,
+        api_client_factory=api_factory,
         sleep_func=no_sleep,
     )
     return coordinator, store
@@ -173,7 +175,7 @@ async def test_all_active_runs_full_refresh_with_cache():
     result = await coordinator._async_update_data()
 
     assert api.calls == [
-        "enter", "system_info", "system_status", "device_info", "system_version"
+        "enter", "system_info", "system_status", "device_info", "system_version", "exit"
     ]
     assert result["data_stale"] is False
     assert result["device_info"] == SAMPLE_DATA["device_info"]
@@ -223,6 +225,38 @@ async def test_second_403_is_not_retried_again():
 
 
 @pytest.mark.asyncio
+async def test_sleep_aware_403_reauthenticates_once_in_same_short_session():
+    api = FakeAPI([ForbiddenError(403), None])
+    coordinator, _ = make_coordinator(api, FakeProbe(ALL_ACTIVE))
+
+    result = await coordinator._async_update_data()
+
+    assert result["last_api_attempt_status"] == "success"
+    assert api.calls.count("enter") == 1
+    assert api.calls.count("login") == 1
+    assert api.calls.count("system_info") == 2
+    assert api.calls.count("exit") == 1
+    assert coordinator._active_api_client is None
+
+
+@pytest.mark.asyncio
+async def test_sleep_aware_second_403_stops_and_keeps_safe_diagnostics():
+    api = FakeAPI([ForbiddenError(403), ForbiddenError(403)])
+    coordinator, _ = make_coordinator(api, FakeProbe(ALL_ACTIVE))
+
+    with pytest.raises(UpdateFailed, match="authentication_failed"):
+        await coordinator._async_update_data()
+
+    assert api.calls.count("enter") == 1
+    assert api.calls.count("login") == 1
+    assert api.calls.count("system_info") == 2
+    assert api.calls.count("exit") == 1
+    assert coordinator.api_diagnostics["last_api_attempt_status"] == "error"
+    assert coordinator.api_diagnostics["last_api_error_type"] == "authentication_failed"
+    assert coordinator._active_api_client is None
+
+
+@pytest.mark.asyncio
 async def test_restart_with_cache_and_sleeping_disks_preserves_values():
     api = FakeAPI()
     probe = FakeProbe(
@@ -269,6 +303,7 @@ async def test_first_active_refresh_loads_static_endpoints():
         "system_status",
         "device_info",
         "system_version",
+        "exit",
     ]
 
 
@@ -288,6 +323,57 @@ async def test_shutdown_closes_http_and_ssh_once():
     assert probe.closed == 1
 
 
+@pytest.mark.asyncio
+async def test_sleep_aware_full_polls_use_distinct_short_lived_clients():
+    clients = []
+
+    def factory():
+        client = FakeAPI()
+        clients.append(client)
+        return client
+
+    probe = FakeProbe(ALL_ACTIVE)
+    coordinator, _ = make_coordinator(
+        None, probe, api_factory=factory
+    )
+    await coordinator._async_update_data()
+    probe.states = {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_STANDBY}
+    await coordinator._async_update_data()
+    probe.states = ALL_ACTIVE
+    await coordinator._async_update_data()
+
+    assert len(clients) == 2
+    assert clients[0] is not clients[1]
+    assert all(client.calls[0] == "enter" for client in clients)
+    assert all(client.calls[-1] == "exit" for client in clients)
+    assert coordinator._active_api_client is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_snapshot_closes_short_lived_api_client():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingAPI(FakeAPI):
+        async def system_info(self):
+            self.calls.append("system_info")
+            entered.set()
+            await release.wait()
+
+    api = BlockingAPI()
+    coordinator, _ = make_coordinator(
+        None, FakeProbe(ALL_ACTIVE), api_factory=lambda: api
+    )
+    task = asyncio.create_task(coordinator._async_update_data())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert api.calls == ["enter", "system_info", "exit"]
+    assert coordinator._active_api_client is None
+
+
 ALL_ACTIVE = {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_ACTIVE}
 BLOCKED_STATES = [
     {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_STANDBY},
@@ -298,6 +384,54 @@ BLOCKED_STATES = [
     {},
     None,  # SSH error: the coordinator must treat it as unknown.
 ]
+
+
+@pytest.mark.asyncio
+async def test_api_diagnostics_are_safe_deduplicated_and_cleared(caplog):
+    secret = "super-secret-token-cookie-header"
+    api = FakeAPI([RuntimeError(secret), RuntimeError(secret), TimeoutError(secret)])
+    coordinator, _ = make_coordinator(api, FakeProbe(ALL_ACTIVE))
+
+    with caplog.at_level(logging.WARNING, logger="test"):
+        with pytest.raises(UpdateFailed) as first_error:
+            await coordinator._async_update_data()
+        first_attempt = coordinator.api_diagnostics["last_api_attempt"]
+        coordinator._last_api_attempt_at = "2020-01-01T00:00:00+00:00"
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+    diagnostics = coordinator.api_diagnostics
+    assert first_attempt is not None
+    assert diagnostics["last_api_attempt_status"] == "error"
+    assert diagnostics["last_api_error_type"] == "api_error"
+    assert secret not in str(first_error.value)
+    assert secret not in repr(diagnostics)
+    assert secret not in caplog.text
+    warnings = [
+        record for record in caplog.records
+        if record.getMessage().startswith("WD API snapshot failed")
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is not None
+
+    coordinator._last_api_attempt_at = "2020-01-01T00:00:00+00:00"
+    with (
+        caplog.at_level(logging.WARNING, logger="test"),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+    assert coordinator.api_diagnostics["last_api_error_type"] == "timeout"
+    warnings = [
+        record for record in caplog.records
+        if record.getMessage().startswith("WD API snapshot failed")
+    ]
+    assert len(warnings) == 2
+
+    coordinator._last_api_attempt_at = "2020-01-01T00:00:00+00:00"
+    result = await coordinator._async_update_data()
+    assert result["last_api_attempt_status"] == "success"
+    assert result["last_api_error_type"] is None
+    assert result["last_api_error"] is None
 
 
 @pytest.mark.asyncio
@@ -323,7 +457,7 @@ async def test_continuous_all_active_polls_api_only_once(with_cache):
 
     assert probe.checks == 5
     assert api.calls == [
-        "enter", "system_info", "system_status", "device_info", "system_version"
+        "enter", "system_info", "system_status", "device_info", "system_version", "exit"
     ]
     # The wake-phase allowance is intentionally not part of persistent storage.
     assert set(store.saved[-1]) == {"data", "last_full_update", "ssh_host_key"}
@@ -354,9 +488,10 @@ async def test_blocked_probe_rearms_exactly_one_full_wake_poll(blocked_states):
     probe.error = False
     awake = await coordinator._async_update_data()
     assert awake["data_stale"] is False
-    assert api.calls.count("enter") == 1
-    assert api.calls.count("login") == 0
     expected_polls = 2 if POWER_STANDBY in (blocked_states or {}).values() else 1
+    assert api.calls.count("enter") == expected_polls
+    assert api.calls.count("exit") == expected_polls
+    assert api.calls.count("login") == 0
     for endpoint in SAMPLE_DATA:
         assert api.calls.count(endpoint) == expected_polls
     assert len(store.saved) == saves_after_first + int(expected_polls == 2)
@@ -393,13 +528,21 @@ async def test_no_cache_waits_for_all_active_before_first_poll(blocked_states):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_cache", [False, True])
-@pytest.mark.parametrize("failure", [RuntimeError("unavailable"), ForbiddenError(403)])
-async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cache, failure):
-    api = FakeAPI([failure])
+@pytest.mark.parametrize(
+    ("failures", "initial_calls", "login_calls"),
+    [
+        ([RuntimeError("unavailable")], 1, 0),
+        ([ForbiddenError(403), ForbiddenError(403)], 2, 1),
+    ],
+)
+async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(
+    with_cache, failures, initial_calls, login_calls
+):
+    api = FakeAPI(failures)
     probe = FakeProbe(ALL_ACTIVE)
     coordinator, _ = make_coordinator(api, probe, with_cache=with_cache)
 
-    with pytest.raises(UpdateFailed, match="Error fetching data"):
+    with pytest.raises(UpdateFailed, match="WD API snapshot failed"):
         await coordinator._async_update_data()
     for _ in range(3):
         if with_cache:
@@ -410,8 +553,8 @@ async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cac
         else:
             with pytest.raises(UpdateFailed, match="configured API interval"):
                 await coordinator._async_update_data()
-        assert api.calls.count("system_info") == 1
-        assert api.calls.count("login") == 0
+        assert api.calls.count("system_info") == initial_calls
+        assert api.calls.count("login") == login_calls
 
     probe.states = BLOCKED_STATES[0]
     if with_cache:
@@ -425,11 +568,11 @@ async def test_failed_api_attempt_is_not_repeated_until_next_wake_phase(with_cac
     else:
         with pytest.raises(UpdateFailed, match="configured API interval"):
             await coordinator._async_update_data()
-    assert api.calls.count("system_info") == 1
+    assert api.calls.count("system_info") == initial_calls
     coordinator._last_api_attempt_at = "2020-01-01T00:00:00+00:00"
     await coordinator._async_update_data()
-    assert api.calls.count("system_info") == 2
-    assert api.calls.count("login") == int(isinstance(failure, ForbiddenError))
+    assert api.calls.count("system_info") == initial_calls + 1
+    assert api.calls.count("login") == login_calls
 
 
 @pytest.mark.asyncio
