@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.5` (manifest version `1.3.5`) or select `main` when testing current development changes.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.6` (manifest version `1.3.6`) or select `main` when testing current development changes.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -77,7 +77,7 @@ The shorter probe interval and bounded follow-ups catch transitions the old 60/6
 
 After a successful full refresh, the four WD API results are saved in Home Assistant storage. Blocked states retain those values with `data_stale: true` and an unchanged `last_successful_update`. A confirmed all-active state with a recent successful snapshot remains `data_stale: false` even when no full poll is due. Sleeping entities show `standby` as on and `active/idle` as off; any `unknown` or probe error makes all Sleeping entities unavailable for that ambiguous result.
 
-The 10-second loop does not publish a Home Assistant coordinator update for an unchanged result and does not rewrite the cache. It notifies entities only for a relevant power/diagnostic transition or a full API snapshot, so the changing internal `last_power_check` alone does not create recorder traffic. Every permitted complete sleep-aware snapshot uses a fresh, short-lived `wdnas-client` and closes its HTTP session immediately afterward. No WD HTTP session remains open between wake phases. Legacy mode retains its established client lifecycle. The owned loop and all SSH/HTTP resources are cancelled or closed on integration unload.
+The 10-second loop does not publish a Home Assistant coordinator update for an unchanged result and does not rewrite the cache. It notifies entities only for a relevant power/diagnostic transition or a full API snapshot, so the changing internal `last_power_check` alone does not create recorder traffic. Home Assistant registers this permanent loop as a Config Entry background task, so it does not delay bootstrap and is automatically cancelled with the entry lifecycle. Every permitted complete sleep-aware snapshot uses a fresh, short-lived `wdnas-client` and closes its HTTP session immediately afterward. No WD HTTP session remains open between wake phases. Legacy mode retains its established client lifecycle. The owned loop and all SSH/HTTP resources are cancelled or closed on integration unload.
 
 On the first setup there is no snapshot to retain. Enable sleep-aware mode only when the NAS disks are already awake and allow one successful refresh. If the disks are sleeping or their state is unknown, setup stops with a message asking you to wake them; it does not silently call the WD API. There is no automatic force refresh.
 

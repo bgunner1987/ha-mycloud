@@ -1,5 +1,6 @@
 """Exercise real platform setup, coordinator and entities with synthetic NAS I/O."""
 
+import asyncio
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
@@ -64,10 +65,15 @@ async def setup_platform(monkeypatch, snapshot, options):
 
     monkeypatch.setattr(platform.SSHPowerStateClient, "async_check", check_power)
     hass = SimpleNamespace(data={DOMAIN: {"test-entry": {}}})
+
+    def create_background_task(_hass, coroutine, name):
+        return asyncio.create_task(coroutine, name=name)
+
     entry = SimpleNamespace(
         entry_id="test-entry",
         data={HOST: "nas.example.invalid", USERNAME: "test", PASSWORD: "unused-test-value", VERSION: 5},
         options=options,
+        async_create_background_task=create_background_task,
     )
     entities = []
     await platform.async_setup_entry(hass, entry, entities.extend)

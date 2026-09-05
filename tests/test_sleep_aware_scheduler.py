@@ -1,6 +1,7 @@
 """Regression tests for bounded probes, wake phases and quiet HA updates."""
 
 import asyncio
+import inspect
 import logging
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -49,7 +50,62 @@ class ControlledSleep:
         self.delays.append(delay)
 
 
-def make_scheduler(states, *, with_cache=True, update_seconds=600, sleep=None):
+class TaskTrackingHass:
+    """Model Home Assistant's separate normal and background task buckets."""
+
+    def __init__(self):
+        self.normal_tasks = set()
+        self.background_tasks = set()
+        self.normal_create_calls = 0
+
+    def async_create_task(self, coroutine, name=None):
+        self.normal_create_calls += 1
+        task = asyncio.create_task(coroutine, name=name)
+        self.normal_tasks.add(task)
+        task.add_done_callback(self.normal_tasks.discard)
+        return task
+
+    def async_create_background_task(self, coroutine, name, eager_start=True):
+        task = asyncio.create_task(coroutine, name=name)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
+    async def async_block_till_done(self):
+        if self.normal_tasks:
+            await asyncio.gather(*tuple(self.normal_tasks))
+
+
+class LifecycleConfigEntry:
+    """Mirror ConfigEntry ownership and automatic cancellation on unload."""
+
+    def __init__(self):
+        self.background_tasks = set()
+        self.create_calls = []
+
+    def async_create_background_task(
+        self, hass, coroutine, name, eager_start=True
+    ):
+        self.create_calls.append((hass, name, eager_start))
+        task = hass.async_create_background_task(
+            coroutine, name, eager_start=eager_start
+        )
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
+    async def async_cancel_background_tasks(self):
+        tasks = tuple(self.background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def make_scheduler(
+    states, *, with_cache=True, update_seconds=600, sleep=None,
+    hass=None, config_entry=None
+):
     envelope = (
         {
             "data": deepcopy(SAMPLE_DATA),
@@ -62,12 +118,15 @@ def make_scheduler(states, *, with_cache=True, update_seconds=600, sleep=None):
     api = FakeAPI()
     store = FakeStore()
     sleeper = sleep or ControlledSleep()
+    hass = hass or TaskTrackingHass()
+    config_entry = config_entry or LifecycleConfigEntry()
     coordinator = MyCloudDataUpdateCoordinator(
-        hass=object(),
+        hass=hass,
         logger=logging.getLogger("test"),
         api_client=api,
         store=store,
         update_interval=timedelta(seconds=update_seconds),
+        config_entry=config_entry,
         cached_envelope=envelope,
         power_client=probe,
         power_probe_interval=timedelta(seconds=10),
@@ -331,3 +390,120 @@ async def test_shutdown_cancels_owned_timer_and_closes_both_clients():
     assert coordinator.power_probe_task is None
     assert coordinator.power_client.closed == 1
     assert api.calls.count("exit") == 1
+
+
+class BlockingLoopSleep:
+    """Keep a background loop pending without wall-clock delays."""
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, delay):
+        self.started.set()
+        await self.release.wait()
+
+
+@pytest.mark.asyncio
+async def test_probe_loop_uses_config_entry_background_task_and_is_idempotent():
+    hass = TaskTrackingHass()
+    entry = LifecycleConfigEntry()
+    sleep = BlockingLoopSleep()
+    coordinator, _, _, _, _ = make_scheduler(
+        [ACTIVE], sleep=sleep, hass=hass, config_entry=entry
+    )
+
+    coordinator.async_start_power_probe_loop()
+    task = coordinator.power_probe_task
+    await sleep.started.wait()
+    coordinator.async_start_power_probe_loop()
+
+    assert task is coordinator.power_probe_task
+    assert entry.create_calls == [(hass, "mycloud power probe", True)]
+    assert task in entry.background_tasks
+    assert task in hass.background_tasks
+    assert hass.normal_create_calls == 0
+    assert hass.normal_tasks == set()
+    assert not task.done()
+    await asyncio.wait_for(hass.async_block_till_done(), timeout=0.1)
+    assert not task.done()
+
+    await coordinator.async_shutdown()
+    await coordinator.async_shutdown()
+    assert task.done()
+    assert coordinator.power_probe_task is None
+
+
+def test_failed_background_registration_closes_unowned_coroutine():
+    class RejectingEntry:
+        coroutine = None
+
+        def async_create_background_task(self, hass, coroutine, name):
+            self.coroutine = coroutine
+            raise RuntimeError("synthetic registration failure")
+
+    entry = RejectingEntry()
+    coordinator, _, _, _, _ = make_scheduler(
+        [ACTIVE], hass=TaskTrackingHass(), config_entry=entry
+    )
+
+    with pytest.raises(RuntimeError, match="registration failure"):
+        coordinator.async_start_power_probe_loop()
+
+    assert coordinator.power_probe_task is None
+    assert inspect.getcoroutinestate(entry.coroutine) == inspect.CORO_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_config_entry_auto_cancel_and_manual_cleanup_do_not_collide():
+    hass = TaskTrackingHass()
+    entry = LifecycleConfigEntry()
+    sleep = BlockingLoopSleep()
+    coordinator, _, _, _, _ = make_scheduler(
+        [ACTIVE], sleep=sleep, hass=hass, config_entry=entry
+    )
+    coordinator.async_start_power_probe_loop()
+    task = coordinator.power_probe_task
+    await sleep.started.wait()
+
+    await entry.async_cancel_background_tasks()
+    await coordinator.async_shutdown()
+    await coordinator.async_shutdown()
+
+    assert task.done()
+    assert coordinator.power_probe_task is None
+    assert coordinator.power_client.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_reload_replaces_old_loop_with_exactly_one_new_background_task():
+    hass = TaskTrackingHass()
+    entry = LifecycleConfigEntry()
+    first_sleep = BlockingLoopSleep()
+    first, _, _, _, _ = make_scheduler(
+        [ACTIVE], sleep=first_sleep, hass=hass, config_entry=entry
+    )
+    first.async_start_power_probe_loop()
+    old_task = first.power_probe_task
+    await first_sleep.started.wait()
+    await first.async_shutdown()
+    await asyncio.sleep(0)
+
+    second_sleep = BlockingLoopSleep()
+    second, _, _, _, _ = make_scheduler(
+        [ACTIVE], sleep=second_sleep, hass=hass, config_entry=entry
+    )
+    second.async_start_power_probe_loop()
+    new_task = second.power_probe_task
+    await second_sleep.started.wait()
+    second.async_start_power_probe_loop()
+
+    assert old_task.done()
+    assert new_task is not old_task
+    assert not new_task.done()
+    assert len(entry.background_tasks) == 1
+    assert len(hass.background_tasks) == 1
+    assert len(entry.create_calls) == 2
+    assert hass.normal_create_calls == 0
+
+    await second.async_shutdown()

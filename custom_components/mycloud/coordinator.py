@@ -100,6 +100,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._api_client = api_client
         self._api_client_factory = api_client_factory
         self._active_api_client = None
+        self._config_entry = config_entry
         self._integration_logger = logger
         self._api_started = False
         self._store = store
@@ -157,12 +158,20 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Start the single owned lightweight probe loop."""
         if self.power_client is None or self._closed or self._probe_task is not None:
             return
+        if self._config_entry is None:
+            raise RuntimeError("A config entry is required for the power probe loop")
         coroutine = self._async_power_probe_loop()
-        create_task = getattr(self.hass, "async_create_task", None)
-        if create_task is not None:
-            self._probe_task = create_task(coroutine, name="mycloud power probe")
-        else:
-            self._probe_task = asyncio.create_task(coroutine, name="mycloud power probe")
+        try:
+            self._probe_task = self._config_entry.async_create_background_task(
+                self.hass,
+                coroutine,
+                name="mycloud power probe",
+            )
+        except BaseException:
+            # Registration failed before ownership was transferred. Closing the
+            # coroutine prevents an unawaited-coroutine leak on setup failure.
+            coroutine.close()
+            raise
 
     async def _async_save_cache(self) -> None:
         await self._store.async_save(
