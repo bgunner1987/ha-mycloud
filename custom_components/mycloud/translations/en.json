@@ -19,7 +19,7 @@
                 "data_description": {
                     "update_interval": "Legacy polling interval, and the minimum spacing for periodic full API snapshots in sleep-aware mode. Does not control disk power checks.",
                     "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default and minimum 10 seconds.",
-                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Leave disabled for legacy behavior. Unknown states always block WD API polling when enabled.",
+                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Leave disabled for legacy behavior. Unknown states block WD API polling but retain each disk's last confirmed Sleeping state.",
                     "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
                     "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."
                 }
@@ -52,7 +52,7 @@
                 "data_description": {
                     "update_interval": "Legacy polling interval, and the minimum spacing for periodic full API snapshots in sleep-aware mode. Does not control disk power checks.",
                     "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default and minimum 10 seconds.",
-                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Unknown states always block WD API polling.",
+                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Unknown states block WD API polling but retain each disk's last confirmed Sleeping state.",
                     "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
                     "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."
                 }

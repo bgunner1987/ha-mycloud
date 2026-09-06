@@ -19,7 +19,7 @@
                 "data_description": {
                     "update_interval": "Bisheriges Abfrageintervall und Mindestabstand regelmäßiger vollständiger API-Snapshots im schlafbewussten Modus. Steuert nicht die Prüfung des Plattenzustands.",
                     "power_probe_interval": "Nicht weckende SSH-/hdparm-Prüfung im schlafbewussten Modus. Standard und Minimum 10 Sekunden.",
-                    "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Deaktiviert bleibt das bisherige Verhalten erhalten. Unbekannte Zustände sperren bei aktivierter Funktion immer die WD-API.",
+                    "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Deaktiviert bleibt das bisherige Verhalten erhalten. Unbekannte Zustände sperren die WD-API, behalten aber je Platte den zuletzt bestätigten Sleeping-Zustand bei.",
                     "ssh_password": "Wird von Home Assistant gespeichert. Möglichst eigene Zugangsdaten verwenden und den Zugriff auf Home-Assistant-Sicherungen beschränken.",
                     "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc."
                 }
@@ -52,7 +52,7 @@
                 "data_description": {
                     "update_interval": "Bisheriges Abfrageintervall und Mindestabstand regelmäßiger vollständiger API-Snapshots im schlafbewussten Modus. Steuert nicht die Prüfung des Plattenzustands.",
                     "power_probe_interval": "Nicht weckende SSH-/hdparm-Prüfung im schlafbewussten Modus. Standard und Minimum 10 Sekunden.",
-                    "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Unbekannte Zustände sperren immer die WD-API.",
+                    "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Unbekannte Zustände sperren die WD-API, behalten aber je Platte den zuletzt bestätigten Sleeping-Zustand bei.",
                     "ssh_password": "Wird von Home Assistant gespeichert. Möglichst eigene Zugangsdaten verwenden und den Zugriff auf Home-Assistant-Sicherungen beschränken.",
                     "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc."
                 }

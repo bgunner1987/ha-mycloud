@@ -40,7 +40,6 @@ from .coordinator import MyCloudDataUpdateCoordinator
 from .power_probe import (
     POWER_ACTIVE,
     POWER_STANDBY,
-    POWER_UNKNOWN,
     SSHPowerStateClient,
     parse_drive_devices,
 )
@@ -425,14 +424,11 @@ class MyCloudDiskSleepSensor(MyCloudCachedEntity, BinarySensorEntity):
         if self.coordinator.data.get("sleep_aware_enabled"):
             return (
                 self._drive_device is not None
-                and self.coordinator.power_probe_status != "unknown"
-                and not (
-                    self.coordinator.power_probe_status == "error"
-                    and self.coordinator.consecutive_probe_failures >= 2
-                )
-                and POWER_UNKNOWN not in power_states.values()
-                and power_states.get(self._drive_device) != POWER_UNKNOWN
                 and self._drive_device in power_states
+                and power_states.get(self._drive_device) in (
+                    POWER_ACTIVE,
+                    POWER_STANDBY,
+                )
                 and super().available
             )
         return super().available

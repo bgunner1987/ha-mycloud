@@ -17,7 +17,12 @@ from test_coordinator import (
 )
 from test_probe_diagnostics import SECRET, wrapped
 
-from custom_components.mycloud.power_probe import POWER_UNKNOWN, PowerProbeError
+from custom_components.mycloud.power_probe import (
+    POWER_ACTIVE,
+    POWER_STANDBY,
+    POWER_UNKNOWN,
+    PowerProbeError,
+)
 from custom_components.mycloud.sensor import (
     MyCloudCPUSensor,
     MyCloudDiskSleepSensor,
@@ -71,8 +76,14 @@ async def test_error_diagnostics_on_available_system_sensors(cause, expected, ca
             assert attrs["last_power_check"] == coordinator.last_power_check
             assert attrs["last_power_check"] is not None
             assert attrs["last_successful_power_check"] is None
+            assert attrs["last_conclusive_power_check"] is None
             assert attrs["consecutive_probe_failures"] == failure_count
             assert attrs["power_states"] == dict.fromkeys(probe.drive_devices, POWER_UNKNOWN)
+            assert attrs["raw_power_states"] == attrs["power_states"]
+            assert attrs["last_confirmed_power_states"] == {}
+            assert attrs["power_state_stale"] is True
+            assert attrs["api_poll_allowed"] is False
+            assert attrs["api_block_reason"] == "probe_error"
             assert expected in attrs["last_power_probe_error"]
             assert attrs["data_stale"] is True
             assert attrs["last_successful_update"] == "2026-09-03T08:00:00+00:00"
@@ -91,7 +102,7 @@ async def test_error_diagnostics_on_available_system_sensors(cause, expected, ca
 
 
 @pytest.mark.asyncio
-async def test_sleeping_entity_tolerates_one_failure_but_api_gate_does_not(caplog):
+async def test_repeated_timeout_keeps_confirmed_state_but_api_gate_stays_closed(caplog):
     api = FakeAPI()
     probe = ErrorProbe(None)
     coordinator, _ = make_coordinator(api, probe)
@@ -119,8 +130,9 @@ async def test_sleeping_entity_tolerates_one_failure_but_api_gate_does_not(caplo
 
     coordinator.data = await coordinator._async_update_data()
     assert coordinator.consecutive_probe_failures == 2
-    assert not sleeping.available
-    assert sleeping.is_on is None
+    assert sleeping.available
+    assert sleeping.is_on is False
+    assert coordinator.power_probe_diagnostics["api_block_reason"] == "probe_error"
     assert api.calls == api_calls_after_success
     assert len(warnings(caplog)) == 1
 
@@ -138,7 +150,7 @@ async def test_sleeping_entity_tolerates_one_failure_but_api_gate_does_not(caplo
 
 
 @pytest.mark.asyncio
-async def test_security_failure_is_not_hidden_by_sleeping_display_tolerance():
+async def test_security_failure_keeps_display_state_but_is_diagnosed_and_blocked():
     api = FakeAPI()
     probe = ErrorProbe(None)
     coordinator, _ = make_coordinator(api, probe)
@@ -153,9 +165,221 @@ async def test_security_failure_is_not_hidden_by_sleeping_display_tolerance():
 
     assert coordinator.consecutive_probe_failures == 1
     assert coordinator.power_probe_error_type == "host_key_mismatch"
+    assert sleeping.available
+    assert sleeping.is_on is False
+    assert coordinator.api_poll_allowed is False
+    assert coordinator.api_block_reason == "probe_error"
+    assert api.calls == api_calls_after_success
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirmed_state", "expected_is_on"),
+    [(POWER_STANDBY, True), (POWER_ACTIVE, False)],
+)
+async def test_conclusive_state_then_unknown_keeps_per_drive_display(
+    confirmed_state, expected_is_on, monkeypatch
+):
+    ticks = count()
+    base = datetime(2026, 9, 6, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "custom_components.mycloud.coordinator._utc_now",
+        lambda: (base + timedelta(seconds=next(ticks))).isoformat(),
+    )
+    api = FakeAPI()
+    probe = FakeProbe(
+        {"/dev/sda": confirmed_state, "/dev/sdc": confirmed_state}
+    )
+    coordinator, _ = make_coordinator(api, probe)
+    sleeping = MyCloudDiskSleepSensor(
+        coordinator, {}, "test", "Disk", {"name": "1"}, "/dev/sda"
+    )
+    coordinator.data = await coordinator._async_update_data()
+    api_calls_after_conclusive = list(api.calls)
+    successful_time = coordinator.last_successful_power_check
+    conclusive_time = coordinator.last_conclusive_power_check
+
+    probe.states = {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": confirmed_state}
+    coordinator.data = await coordinator._async_update_data()
+
+    diagnostics = coordinator.power_probe_diagnostics
+    assert sleeping.available
+    assert sleeping.is_on is expected_is_on
+    assert diagnostics["raw_power_states"]["/dev/sda"] == POWER_UNKNOWN
+    assert diagnostics["last_confirmed_power_states"]["/dev/sda"] == confirmed_state
+    assert diagnostics["power_probe_status"] == "unknown"
+    assert diagnostics["power_state_stale"] is True
+    assert diagnostics["last_successful_power_check"] != successful_time
+    assert diagnostics["last_conclusive_power_check"] == conclusive_time
+    assert diagnostics["consecutive_probe_failures"] == 0
+    assert diagnostics["api_poll_allowed"] is False
+    assert diagnostics["api_block_reason"] == "unknown"
+    assert api.calls == api_calls_after_conclusive
+
+
+@pytest.mark.asyncio
+async def test_unknown_without_any_confirmed_state_is_unavailable():
+    probe = FakeProbe(
+        {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": POWER_UNKNOWN}
+    )
+    coordinator, _ = make_coordinator(FakeAPI(), probe)
+    sleeping = MyCloudDiskSleepSensor(
+        coordinator, {}, "test", "Disk", {"name": "1"}, "/dev/sda"
+    )
+
+    coordinator.data = await coordinator._async_update_data()
+
     assert not sleeping.available
     assert sleeping.is_on is None
-    assert api.calls == api_calls_after_success
+    assert coordinator.visible_power_states == {}
+    assert coordinator.last_successful_power_check is not None
+    assert coordinator.last_conclusive_power_check is None
+    assert coordinator.consecutive_probe_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_drive_retains_its_state_while_conclusive_peer_updates():
+    api = FakeAPI()
+    probe = FakeProbe(
+        {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_STANDBY}
+    )
+    coordinator, _ = make_coordinator(api, probe)
+    sda = MyCloudDiskSleepSensor(
+        coordinator, {}, "sda", "Disk sda", {"name": "sda"}, "/dev/sda"
+    )
+    sdc = MyCloudDiskSleepSensor(
+        coordinator, {}, "sdc", "Disk sdc", {"name": "sdc"}, "/dev/sdc"
+    )
+    coordinator.data = await coordinator._async_update_data()
+
+    probe.states = {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": POWER_ACTIVE}
+    coordinator.data = await coordinator._async_update_data()
+
+    assert sda.available and sda.is_on is True
+    assert sdc.available and sdc.is_on is False
+    assert coordinator.power_states == {
+        "/dev/sda": POWER_UNKNOWN,
+        "/dev/sdc": POWER_ACTIVE,
+    }
+    assert coordinator.visible_power_states == {
+        "/dev/sda": POWER_STANDBY,
+        "/dev/sdc": POWER_ACTIVE,
+    }
+    assert coordinator.api_poll_allowed is False
+    assert coordinator.api_block_reason == "unknown"
+    assert api.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("states", "allowed", "reason", "api_polls"),
+    [
+        (ALL_ACTIVE, True, None, 1),
+        (
+            {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_STANDBY},
+            False,
+            "mixed",
+            0,
+        ),
+        (
+            {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_UNKNOWN},
+            False,
+            "unknown",
+            0,
+        ),
+    ],
+)
+async def test_api_gate_uses_only_same_cycle_raw_states(
+    states, allowed, reason, api_polls
+):
+    api = FakeAPI()
+    coordinator, _ = make_coordinator(api, FakeProbe(states))
+
+    coordinator.data = await coordinator._async_update_data()
+
+    assert coordinator.api_poll_allowed is allowed
+    assert coordinator.api_block_reason == reason
+    assert api.calls.count("system_info") == api_polls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recovered_state", "expected_is_on"),
+    [(POWER_ACTIVE, False), (POWER_STANDBY, True)],
+)
+async def test_unknown_recovers_immediately_to_new_conclusive_state(
+    recovered_state, expected_is_on
+):
+    probe = FakeProbe(
+        {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": POWER_UNKNOWN}
+    )
+    coordinator, _ = make_coordinator(FakeAPI(), probe)
+    sleeping = MyCloudDiskSleepSensor(
+        coordinator, {}, "test", "Disk", {"name": "1"}, "/dev/sda"
+    )
+    coordinator.data = await coordinator._async_update_data()
+    assert not sleeping.available
+
+    probe.states = {
+        "/dev/sda": recovered_state,
+        "/dev/sdc": POWER_ACTIVE,
+    }
+    coordinator.data = await coordinator._async_update_data()
+
+    assert sleeping.available
+    assert sleeping.is_on is expected_is_on
+    assert coordinator.power_states["/dev/sda"] == recovered_state
+    assert coordinator.visible_power_states["/dev/sda"] == recovered_state
+    assert coordinator.power_state_stale is False
+    assert coordinator.last_conclusive_power_check is not None
+
+
+@pytest.mark.asyncio
+async def test_repeated_unknown_never_changes_confirmed_sleeping_state():
+    api = FakeAPI()
+    probe = FakeProbe(
+        {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_ACTIVE}
+    )
+    coordinator, _ = make_coordinator(api, probe)
+    sleeping = MyCloudDiskSleepSensor(
+        coordinator, {}, "test", "Disk", {"name": "1"}, "/dev/sda"
+    )
+    coordinator.data = await coordinator._async_update_data()
+    api_calls = list(api.calls)
+
+    probe.states = {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": POWER_ACTIVE}
+    observed = []
+    for _ in range(3):
+        coordinator.data = await coordinator._async_update_data()
+        observed.append((sleeping.available, sleeping.is_on))
+
+    assert observed == [(True, False)] * 3
+    assert coordinator.power_states["/dev/sda"] == POWER_UNKNOWN
+    assert coordinator.visible_power_states["/dev/sda"] == POWER_ACTIVE
+    assert api.calls == api_calls
+
+
+@pytest.mark.asyncio
+async def test_probe_error_after_restart_keeps_api_cache_but_no_power_state():
+    api = FakeAPI()
+    coordinator, _ = make_coordinator(
+        api, ErrorProbe(TimeoutError(SECRET)), with_cache=True
+    )
+    cpu = MyCloudCPUSensor(coordinator, {}, "test", "NAS")
+    sleeping = MyCloudDiskSleepSensor(
+        coordinator, {}, "test", "Disk", {"name": "1"}, "/dev/sda"
+    )
+
+    coordinator.data = await coordinator._async_update_data()
+
+    assert cpu.available and cpu.state == 7
+    assert not sleeping.available
+    assert sleeping.is_on is None
+    assert coordinator.visible_power_states == {}
+    assert coordinator.api_poll_allowed is False
+    assert coordinator.api_block_reason == "probe_error"
+    assert coordinator.data["data_stale"] is True
+    assert api.calls == []
 
 
 @pytest.mark.asyncio
@@ -244,7 +468,14 @@ async def test_legacy_mode_diagnostics_are_disabled():
     assert coordinator.power_probe_diagnostics == {
         "last_power_check": None,
         "last_successful_power_check": None,
+        "last_conclusive_power_check": None,
         "consecutive_probe_failures": 0,
-        "power_states": {}, "power_probe_status": "disabled",
+        "power_states": {},
+        "raw_power_states": {},
+        "last_confirmed_power_states": {},
+        "power_state_stale": None,
+        "power_probe_status": "disabled",
         "power_probe_error_type": None, "last_power_probe_error": None,
+        "api_poll_allowed": True,
+        "api_block_reason": None,
     }

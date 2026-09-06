@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.7` (manifest version `1.3.7`) or select `main` when testing current development changes.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.8` (manifest version `1.3.8`) or select `main` when testing current development changes.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -75,7 +75,7 @@ This avoids repeatedly resetting the NAS standby timer: continuous all-active op
 
 The shorter probe interval and bounded follow-ups catch transitions the old 60/600-second cadence missed. A complete standby/wake cycle between two checks can still be missed; the interval fallback ensures a later confirmed all-active state can eventually refresh even if only `unknown` was observed.
 
-After a successful full refresh, the four WD API results are saved in Home Assistant storage. Blocked states retain those values with `data_stale: true` and an unchanged `last_successful_update`. A confirmed all-active state with a recent successful snapshot remains `data_stale: false` even when no full poll is due. Sleeping entities show `standby` as on and `active/idle` as off. An explicit `unknown` or a non-timeout SSH error remains unavailable immediately. One isolated SSH timeout temporarily preserves only the visible Sleeping state from the last fully known probe; the current internal state is already `unknown` and blocks the WD API. A second consecutive failed cycle makes Sleeping unavailable. The next successful probe immediately publishes its real state and clears the error fields and failure counter.
+After a successful full refresh, the four WD API results are saved in Home Assistant storage. Blocked states retain those values with `data_stale: true` and an unchanged `last_successful_update`. A confirmed all-active state with a recent successful snapshot remains `data_stale: false` even when no full poll is due. Sleeping entities show `standby` as on and `active/idle` as off. Each conclusive raw result updates that disk's runtime-only confirmed state immediately, even when another disk is unknown. A raw `unknown` or SSH/command failure retains the affected disk's last confirmed visible state while still blocking the WD API for that cycle. A Sleeping entity is unavailable only until that disk has produced its first conclusive result since the integration started. Confirmed power states are not persisted across restarts. The next conclusive result immediately replaces the retained display state.
 
 The 10-second loop does not publish a Home Assistant coordinator update for an unchanged successful result and does not rewrite the cache. It notifies entities for a relevant power/diagnostic transition, failure-count change, or full API snapshot, so the changing internal `last_power_check` alone does not create recorder traffic. Home Assistant registers this permanent loop as a Config Entry background task, so it does not delay bootstrap and is automatically cancelled with the entry lifecycle. Every permitted complete sleep-aware snapshot uses a fresh, short-lived `wdnas-client` and closes its local `aiohttp` session immediately afterward. The client library exposes no documented OS 5 server-side logout operation, so the integration does not invent or call an undocumented endpoint; any server-side session lifetime remains NAS-controlled. Legacy mode retains its established client lifecycle. The owned loop and all SSH/HTTP resources are cancelled or closed on integration unload.
 
@@ -92,12 +92,18 @@ AsyncSSH receives an explicit empty known-hosts object, not empty bytes or `None
 If Sleeping sensors stay unavailable, inspect a **CPU or Memory sensor** in **Developer Tools > States**. System sensors remain available from the stored snapshot during SSH failures; their attributes include:
 
 - `last_power_check`: timestamp of the latest power probe, even on failure.
-- `last_successful_power_check`: timestamp of the latest fully parsed SSH probe.
+- `last_successful_power_check`: timestamp of the latest successfully executed and parsed SSH command, including a result containing `unknown`.
+- `last_conclusive_power_check`: timestamp of the latest probe in which every configured disk returned `active/idle` or `standby`.
 - `consecutive_probe_failures`: consecutive SSH probe exceptions since the last parsed result.
-- `power_states`: validated configured paths and their active/idle, standby, or unknown states.
+- `raw_power_states`: current per-drive SSH/hdparm result used by the API safety gate.
+- `power_states`: backward-compatible alias of `raw_power_states`.
+- `last_confirmed_power_states`: latest runtime-only conclusive state retained independently for each disk and used only by Sleeping entities.
+- `power_state_stale`: true when the current raw probe is missing, failed, or contains `unknown`.
 - `power_probe_status`: `pending`, `disabled`, `ok` (a readable probe, including standby/mixed), `unknown` (hdparm explicitly reports unknown), or `error`.
 - `power_probe_error_type`: current failure category, or null after a successful probe.
 - `last_power_probe_error`: safe description of the current error, cleared on recovery.
+- `api_poll_allowed`: true only when every configured disk is explicitly `active/idle` in the same current raw probe.
+- `api_block_reason`: `not_checked`, `probe_error`, `unknown`, `standby`, or `mixed`; null when the raw probe allows API access.
 
 Failure categories are `authentication_failed`, `host_key_mismatch`, `algorithm_negotiation_failed`, `connection_failed`, `command_failed`, `timeout`, and `parse_failed`. Nonzero command exits and malformed hdparm responses now produce explicit diagnostics; a valid hdparm response of `unknown` is not a parser error. Partial results on a failed probe are discarded and every configured drive is reported unknown.
 

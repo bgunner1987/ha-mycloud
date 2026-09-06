@@ -113,8 +113,9 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_probe_summary: tuple[str, ...] | None = None
         self.last_power_check: str | None = None
         self.last_successful_power_check: str | None = None
+        self.last_conclusive_power_check: str | None = None
         self.power_states: dict[str, str] = {}
-        self._last_safe_power_states: dict[str, str] = {}
+        self._last_confirmed_power_states: dict[str, str] = {}
         self.power_probe_status = "pending" if power_client else "disabled"
         self.power_probe_error_type: str | None = None
         self.last_power_probe_error: str | None = None
@@ -137,28 +138,76 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return {
             "last_power_check": self.last_power_check,
             "last_successful_power_check": self.last_successful_power_check,
+            "last_conclusive_power_check": self.last_conclusive_power_check,
             "consecutive_probe_failures": self.consecutive_probe_failures,
             "power_states": dict(self.power_states),
+            "raw_power_states": dict(self.power_states),
+            "last_confirmed_power_states": dict(
+                self._last_confirmed_power_states
+            ),
+            "power_state_stale": self.power_state_stale,
             "power_probe_status": self.power_probe_status,
             "power_probe_error_type": self.power_probe_error_type,
             "last_power_probe_error": self.last_power_probe_error,
+            "api_poll_allowed": self.api_poll_allowed,
+            "api_block_reason": self.api_block_reason,
         }
 
     @property
     def visible_power_states(self) -> dict[str, str]:
-        """Return entity-only states with one failed-cycle display tolerance.
+        """Return per-drive confirmed states for entity display only.
 
-        The WD API gate never uses this mapping. It always reads the current,
-        fail-closed ``power_states`` result directly.
+        The WD API gate never uses this mapping. It always reads the raw current,
+        fail-closed ``power_states`` result directly. Confirmed states are
+        deliberately runtime-only and start empty after every integration start.
         """
-        if (
-            self.power_probe_status == "error"
-            and self.power_probe_error_type == "timeout"
-            and self.consecutive_probe_failures == 1
-            and set(self._last_safe_power_states) == set(self.drive_devices)
-        ):
-            return dict(self._last_safe_power_states)
-        return dict(self.power_states)
+        return dict(self._last_confirmed_power_states)
+
+    @property
+    def power_state_stale(self) -> bool | None:
+        """Report whether the current raw probe is not fully conclusive."""
+        if self.power_client is None:
+            return None
+        return (
+            self.power_probe_status in ("pending", "error", "unknown")
+            or set(self.power_states) != set(self.drive_devices)
+            or any(
+                self.power_states.get(device) not in _KNOWN_POWER_STATES
+                for device in self.drive_devices
+            )
+        )
+
+    def _api_probe_gate(self) -> tuple[bool, str | None]:
+        """Evaluate the WD API gate exclusively from the current raw probe."""
+        if self.power_client is None:
+            return True, None
+        if self.power_probe_status == "error":
+            return False, "probe_error"
+        if not self.drive_devices or not self.power_states:
+            return False, "not_checked"
+        raw_states = tuple(
+            self.power_states.get(device, POWER_UNKNOWN)
+            for device in self.drive_devices
+        )
+        if POWER_UNKNOWN in raw_states:
+            return False, "unknown"
+        if all(state == POWER_ACTIVE for state in raw_states):
+            return True, None
+        if all(state == POWER_STANDBY for state in raw_states):
+            return False, "standby"
+        if POWER_STANDBY in raw_states:
+            return False, "mixed"
+        return False, "unknown"
+
+    @property
+    def api_poll_allowed(self) -> bool:
+        """Return whether the current raw probe permits WD API access."""
+        return self._api_probe_gate()[0]
+
+    @property
+    def api_block_reason(self) -> str | None:
+        """Return an allowlisted reason when the current raw probe blocks access."""
+        return self._api_probe_gate()[1]
 
     @property
     def api_diagnostics(self) -> dict[str, Any]:
@@ -304,6 +353,10 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _diagnostic_signature(self) -> tuple[Any, ...]:
         return (
             tuple((device, self.power_states.get(device)) for device in self.drive_devices),
+            tuple(
+                (device, self._last_confirmed_power_states.get(device))
+                for device in self.drive_devices
+            ),
             self.power_probe_status,
             self.power_probe_error_type,
             self.last_power_probe_error,
@@ -360,8 +413,14 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.power_probe_error_type = None
         self.last_power_probe_error = None
-        if all(state in _KNOWN_POWER_STATES for state in self.power_states.values()):
-            self._last_safe_power_states = dict(self.power_states)
+        for device, state in self.power_states.items():
+            if state in _KNOWN_POWER_STATES:
+                self._last_confirmed_power_states[device] = state
+        if all(
+            self.power_states.get(device) in _KNOWN_POWER_STATES
+            for device in self.drive_devices
+        ):
+            self.last_conclusive_power_check = check_time
         if previous_failures:
             self._integration_logger.info(
                 "SSH power probe recovered after %d failed cycle(s)",
@@ -447,9 +506,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         before = self._diagnostic_signature()
         await self._async_probe_with_followups()
         changed = before != self._diagnostic_signature()
-        all_active = bool(self.drive_devices) and all(
-            self.power_states.get(device) == POWER_ACTIVE for device in self.drive_devices
-        )
+        all_active = self.api_poll_allowed
         any_standby = POWER_STANDBY in self.power_states.values()
         if any_standby:
             self._wake_poll_pending = True
