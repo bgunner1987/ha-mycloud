@@ -16,7 +16,7 @@ _ERROR_TYPES = {
 }
 _DETAILS = {
     "probe_failed", "connect_failed", "command_failed", "nonzero_exit",
-    "unrecognized_hdparm_output",
+    "unrecognized_hdparm_output", "cleanup_timeout", "cleanup_failed",
 }
 
 
@@ -27,7 +27,9 @@ class PowerProbeError(Exception):
         self, message: str, *, stage="probe", error_type=None, detail=None, exit_status=None
     ):
         super().__init__(message)
-        self.stage = stage if stage in {"probe", "connect", "command"} else "probe"
+        self.stage = (
+            stage if stage in {"probe", "connect", "command", "cleanup"} else "probe"
+        )
         self.error_type = error_type if error_type in _ERROR_TYPES else None
         self.detail = detail if detail in _DETAILS else "probe_failed"
         self.exit_status = (
@@ -134,28 +136,10 @@ def describe_probe_error(error: PowerProbeError) -> ProbeFailure:
     return ProbeFailure(categories[-1] if categories else fallback, error.stage, tuple(chain))
 
 
-class SafeProbeLogError(Exception):
-    """A sanitized causal node, containing neither raw messages nor traceback frames."""
-
-
 def log_probe_failure(logger: logging.Logger, failure: ProbeFailure) -> None:
-    """Log the full sanitized chain with exc_info, not the active raw exception.
-
-    Original traceback frames retain locals (including credentials). Construct a
-    separate chain and remove implicit context before passing it to any handler.
-    """
-    cause = None
-    for description in reversed(failure.chain):
-        safe = SafeProbeLogError(description)
-        safe.__cause__ = cause
-        safe.__suppress_context__ = True
-        cause = safe
-    try:
-        raise cause
-    except SafeProbeLogError as safe:
-        safe.__context__ = None
-        logger.warning(
-            "SSH power probe failed: %s; WD API access blocked",
-            failure.summary,
-            exc_info=True,
-        )
+    """Log one concise allowlisted warning without raw exception tracebacks."""
+    logger.warning(
+        "SSH power probe failed (%s, stage=%s); WD API blocked for this cycle",
+        failure.error_type,
+        failure.stage,
+    )

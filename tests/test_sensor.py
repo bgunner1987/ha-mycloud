@@ -26,6 +26,8 @@ def make_coordinator(power_state):
             "last_api_error": None,
         },
         power_probe_status="unknown" if power_state == POWER_UNKNOWN else "ok",
+        consecutive_probe_failures=0,
+        visible_power_states={"/dev/sda": power_state},
         data={
             "system_info": {
                 "disks": [{"name": "1", "temp": 31, "sleep": False}]

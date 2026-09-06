@@ -421,11 +421,15 @@ class MyCloudDiskSleepSensor(MyCloudCachedEntity, BinarySensorEntity):
 
     @property
     def available(self):
-        power_states = self.coordinator.data.get("power_states", {})
+        power_states = self.coordinator.visible_power_states
         if self.coordinator.data.get("sleep_aware_enabled"):
             return (
                 self._drive_device is not None
-                and self.coordinator.power_probe_status not in ("error", "unknown")
+                and self.coordinator.power_probe_status != "unknown"
+                and not (
+                    self.coordinator.power_probe_status == "error"
+                    and self.coordinator.consecutive_probe_failures >= 2
+                )
                 and POWER_UNKNOWN not in power_states.values()
                 and power_states.get(self._drive_device) != POWER_UNKNOWN
                 and self._drive_device in power_states
@@ -435,9 +439,7 @@ class MyCloudDiskSleepSensor(MyCloudCachedEntity, BinarySensorEntity):
 
     @property
     def is_on(self):
-        power_state = self.coordinator.data.get("power_states", {}).get(
-            self._drive_device
-        )
+        power_state = self.coordinator.visible_power_states.get(self._drive_device)
         if power_state == POWER_STANDBY:
             return True
         if power_state == POWER_ACTIVE:

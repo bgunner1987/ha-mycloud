@@ -6,12 +6,11 @@ import asyncio
 import hmac
 import re
 from collections.abc import Callable, Sequence
-from contextlib import suppress
 from typing import Any
 
 import asyncssh
 
-from .probe_diagnostics import PowerProbeError, describe_probe_error
+from .probe_diagnostics import PowerProbeError
 
 HDPARM_PATH = "/usr/bin/hdparm"
 POWER_ACTIVE = "active/idle"
@@ -23,6 +22,7 @@ _STATE_PATTERN = re.compile(
     r"drive\s+state\s+is\s*:\s*(standby|active/idle|unknown)\b",
     re.IGNORECASE,
 )
+_DEVICE_HEADER_PATTERN = re.compile(r"^\s*(/dev/(?:sd|hd)[a-z]+):\s*$")
 
 
 def parse_drive_devices(value: str | Sequence[str]) -> tuple[str, ...]:
@@ -49,6 +49,49 @@ def parse_hdparm_state(output: str) -> str:
         return POWER_UNKNOWN
     state = match.group(1).lower()
     return state if state in (POWER_ACTIVE, POWER_STANDBY) else POWER_UNKNOWN
+
+
+def parse_hdparm_states(
+    output: str, drive_devices: Sequence[str]
+) -> dict[str, str]:
+    """Parse one multi-device hdparm response without positional assumptions.
+
+    ``hdparm`` prefixes each device result with the device path. Requiring exactly
+    one named section and exactly one state per configured path makes partial,
+    duplicated, reordered, or unexpected output fail closed.
+    """
+    devices = parse_drive_devices(drive_devices)
+    expected = set(devices)
+    sections: dict[str, list[str]] = {}
+    current_device: str | None = None
+
+    for line in output.splitlines():
+        header = _DEVICE_HEADER_PATTERN.fullmatch(line)
+        if header is not None:
+            current_device = header.group(1)
+            if current_device not in expected or current_device in sections:
+                raise ValueError("Unexpected or duplicate hdparm device section")
+            sections[current_device] = []
+            continue
+        if current_device is None:
+            if _STATE_PATTERN.search(line) is not None:
+                raise ValueError("hdparm state has no device section")
+            continue
+        sections[current_device].append(line)
+
+    if set(sections) != expected:
+        raise ValueError("hdparm response is missing a configured device")
+
+    states: dict[str, str] = {}
+    for device in devices:
+        matches = _STATE_PATTERN.findall("\n".join(sections[device]))
+        if len(matches) != 1:
+            raise ValueError("hdparm device section has no unique power state")
+        state = matches[0].lower()
+        states[device] = (
+            state if state in (POWER_ACTIVE, POWER_STANDBY) else POWER_UNKNOWN
+        )
+    return states
 
 
 class _PinnedSSHClient(asyncssh.SSHClient):
@@ -148,64 +191,88 @@ class SSHPowerStateClient:
         return connection
 
     async def _async_check_once(self) -> dict[str, str]:
-        """Read every configured drive state sequentially without other commands."""
+        """Read every configured drive through one connection and one exec channel."""
         states: dict[str, str] = {}
-
+        failure: BaseException | None = None
         try:
             connection = await self._async_connect()
-            for device in self._drive_devices:
-                result = await asyncio.wait_for(
-                    connection.run(f"{HDPARM_PATH} -C {device}", check=False),
-                    timeout=self._timeout,
+            command = f"{HDPARM_PATH} -C {' '.join(self._drive_devices)}"
+            result = await asyncio.wait_for(
+                connection.run(command, check=False),
+                timeout=self._timeout,
+            )
+            if result.exit_status != 0:
+                raise PowerProbeError(
+                    "SSH power-state command failed", stage="command",
+                    error_type="command_failed", detail="nonzero_exit",
+                    exit_status=result.exit_status,
                 )
-                if result.exit_status != 0:
-                    raise PowerProbeError(
-                        "SSH power-state command failed", stage="command",
-                        error_type="command_failed", detail="nonzero_exit",
-                        exit_status=result.exit_status,
-                    )
-                output = f"{result.stdout or ''}\n{result.stderr or ''}"
-                if _STATE_PATTERN.search(output) is None:
-                    raise PowerProbeError(
-                        "Unrecognized hdparm response", stage="command",
-                        error_type="parse_failed", detail="unrecognized_hdparm_output",
-                    )
-                states[device] = parse_hdparm_state(output)
-        except (PowerProbeError, asyncio.CancelledError):
-            raise
-        except Exception as err:
-            raise PowerProbeError(
+            output = f"{result.stdout or ''}\n{result.stderr or ''}"
+            try:
+                states = parse_hdparm_states(output, self._drive_devices)
+            except ValueError as err:
+                raise PowerProbeError(
+                    "Unrecognized hdparm response", stage="command",
+                    error_type="parse_failed", detail="unrecognized_hdparm_output",
+                ) from err
+        except (PowerProbeError, asyncio.CancelledError) as err:
+            failure = err
+        except Exception as err:  # noqa: BLE001 - AsyncSSH exposes varied errors
+            failure = PowerProbeError(
                 "SSH power-state command failed", stage="command", detail="command_failed",
-            ) from err
-        finally:
-            # A successful result is returned only after the connection has been
-            # closed. The same cleanup also covers parser failures and cancellation.
-            with suppress(Exception):
-                close_task = asyncio.create_task(self.async_close())
+            )
+            failure.__cause__ = err
+            failure.__suppress_context__ = True
+
+        # A successful result is returned only after the connection has been
+        # closed. The same bounded cleanup covers parser failures and cancellation.
+        try:
+            close_task = asyncio.create_task(self.async_close())
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
                 try:
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    with suppress(asyncio.CancelledError, Exception):
-                        await close_task
-                    raise
+                    await close_task
+                except Exception:  # noqa: BLE001 - cancellation must win
+                    # Preserve cancellation after bounded best-effort cleanup.
+                    close_task.cancel()
+                raise
+        except PowerProbeError as cleanup_error:
+            if failure is None:
+                failure = cleanup_error
+        except Exception as cleanup_error:  # noqa: BLE001 - normalize SSH cleanup
+            if failure is None:
+                failure = PowerProbeError(
+                    "SSH connection cleanup failed", stage="cleanup",
+                    error_type="connection_failed", detail="cleanup_failed",
+                )
+                failure.__cause__ = cleanup_error
+                failure.__suppress_context__ = True
+
+        if failure is not None:
+            raise failure
 
         return states
 
     async def async_check(self) -> dict[str, str]:
-        """Serialize probes and reconnect once after a connection-level failure."""
+        """Serialize probes; each cycle opens exactly one short connection."""
         async with self._probe_lock:
-            try:
-                return await self._async_check_once()
-            except PowerProbeError as err:
-                if describe_probe_error(err).error_type != "connection_failed":
-                    raise
-                # _async_check_once() has already discarded the failed connection.
-                # One retry is bounded by the same per-operation timeouts.
-                return await self._async_check_once()
+            return await self._async_check_once()
 
     async def async_close(self) -> None:
         """Close the current SSH connection, if any."""
         connection, self._connection = self._connection, None
         if connection is not None:
             connection.close()
-            await connection.wait_closed()
+            try:
+                await asyncio.wait_for(
+                    connection.wait_closed(), timeout=self._timeout
+                )
+            except TimeoutError as err:
+                abort = getattr(connection, "abort", None)
+                if callable(abort):
+                    abort()
+                raise PowerProbeError(
+                    "SSH connection cleanup timed out", stage="cleanup",
+                    error_type="timeout", detail="cleanup_timeout",
+                ) from err

@@ -112,10 +112,13 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.drive_devices = power_client.drive_devices if power_client else ()
         self._last_probe_summary: tuple[str, ...] | None = None
         self.last_power_check: str | None = None
+        self.last_successful_power_check: str | None = None
         self.power_states: dict[str, str] = {}
+        self._last_safe_power_states: dict[str, str] = {}
         self.power_probe_status = "pending" if power_client else "disabled"
         self.power_probe_error_type: str | None = None
         self.last_power_probe_error: str | None = None
+        self.consecutive_probe_failures = 0
         self._last_logged_probe_failure: ProbeFailure | None = None
         self._wake_poll_pending = True
         self._last_api_attempt_at: str | None = None
@@ -133,11 +136,29 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Expose safe runtime diagnostics, including when no snapshot exists."""
         return {
             "last_power_check": self.last_power_check,
+            "last_successful_power_check": self.last_successful_power_check,
+            "consecutive_probe_failures": self.consecutive_probe_failures,
             "power_states": dict(self.power_states),
             "power_probe_status": self.power_probe_status,
             "power_probe_error_type": self.power_probe_error_type,
             "last_power_probe_error": self.last_power_probe_error,
         }
+
+    @property
+    def visible_power_states(self) -> dict[str, str]:
+        """Return entity-only states with one failed-cycle display tolerance.
+
+        The WD API gate never uses this mapping. It always reads the current,
+        fail-closed ``power_states`` result directly.
+        """
+        if (
+            self.power_probe_status == "error"
+            and self.power_probe_error_type == "timeout"
+            and self.consecutive_probe_failures == 1
+            and set(self._last_safe_power_states) == set(self.drive_devices)
+        ):
+            return dict(self._last_safe_power_states)
+        return dict(self.power_states)
 
     @property
     def api_diagnostics(self) -> dict[str, Any]:
@@ -310,6 +331,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _record_probe_failure(self, err: PowerProbeError) -> None:
         failure = describe_probe_error(err)
+        self.consecutive_probe_failures += 1
         self.power_states = dict.fromkeys(self.drive_devices, POWER_UNKNOWN)
         self.power_probe_status = "error"
         self.power_probe_error_type = failure.error_type
@@ -318,7 +340,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             log_probe_failure(self._integration_logger, failure)
             self._last_logged_probe_failure = failure
 
-    def _record_probe_success(self, states: dict[str, str]) -> None:
+    def _record_probe_success(self, states: dict[str, str], check_time: str) -> None:
         # Only configured paths and known states leave the power client.
         self.power_states = {
             device: (
@@ -328,12 +350,23 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             for device in self.drive_devices
         }
+        previous_failures = self.consecutive_probe_failures
+        self.last_successful_power_check = check_time
+        self.consecutive_probe_failures = 0
         self.power_probe_status = (
             "unknown"
             if any(state == POWER_UNKNOWN for state in self.power_states.values())
             else "ok"
         )
         self.power_probe_error_type = None
+        self.last_power_probe_error = None
+        if all(state in _KNOWN_POWER_STATES for state in self.power_states.values()):
+            self._last_safe_power_states = dict(self.power_states)
+        if previous_failures:
+            self._integration_logger.info(
+                "SSH power probe recovered after %d failed cycle(s)",
+                previous_failures,
+            )
         self._last_logged_probe_failure = None
 
     async def _async_probe_with_followups(self) -> None:
@@ -359,7 +392,8 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except PowerProbeError as err:
             self._record_probe_failure(err)
         else:
-            self._record_probe_success(states)
+            check_time = _utc_now()
+            self._record_probe_success(states, check_time)
         self.last_power_check = _utc_now()
         await self._async_persist_new_fingerprint()
         self._log_probe_transition()

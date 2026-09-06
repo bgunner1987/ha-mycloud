@@ -4,7 +4,6 @@ import errno
 import json
 import logging
 import socket
-import traceback
 
 import asyncssh
 import pytest
@@ -49,20 +48,10 @@ def test_real_exception_classification_is_safe(cause, expected, caplog):
     with caplog.at_level(logging.WARNING):
         log_probe_failure(logging.getLogger("test.probe"), failure)
     record = caplog.records[-1]
-    assert record.exc_info is not None
+    assert record.exc_info is None
     assert SECRET not in caplog.text
     assert SECRET not in json.dumps(failure.__dict__)
-    assert SECRET not in "".join(traceback.format_exception(*record.exc_info))
-    # Inspect every exception object received by handlers, not just formatted text.
-    current = record.exc_info[1]
-    count = 0
-    while current is not None:
-        assert SECRET not in str(current)
-        assert current.__context__ is None
-        assert current is not cause
-        count += 1
-        current = current.__cause__
-    assert count == 2
+    assert record.args == (expected, "connect")
 
 
 def test_implicit_context_and_all_chain_nodes_are_sanitized(caplog):
@@ -81,13 +70,10 @@ def test_implicit_context_and_all_chain_nodes_are_sanitized(caplog):
                 log_probe_failure(logging.getLogger("test.probe"), failure)
     assert failure.error_type == "authentication_failed"
     assert len(failure.chain) == 3
-    assert caplog.text.count("SafeProbeLogError:") == 3
+    assert "Traceback" not in caplog.text
     assert SECRET not in caplog.text
     assert "test-secret-class-marker" not in caplog.text
-    current = caplog.records[-1].exc_info[1]
-    while current:
-        assert current.__context__ is None
-        current = current.__cause__
+    assert caplog.records[-1].exc_info is None
 
 
 @pytest.mark.parametrize("kind", ["key exchange", "encryption", "MAC", "compression"])
@@ -140,6 +126,6 @@ def test_generated_key_contents_and_individual_credentials_never_reach_logs(capl
     log_probe_failure(logging.getLogger("test.probe"), failure)
     rendered = caplog.text + json.dumps(failure.__dict__)
     record = caplog.records[-1]
-    rendered += repr(record.args) + "".join(traceback.format_exception(*record.exc_info))
+    rendered += repr(record.args) + repr(record.exc_info)
     for value in canaries:
         assert value not in rendered

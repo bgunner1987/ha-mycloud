@@ -18,6 +18,7 @@ from custom_components.mycloud.power_probe import (
     SSHPowerStateClient,
     parse_drive_devices,
     parse_hdparm_state,
+    parse_hdparm_states,
 )
 from custom_components.mycloud.probe_diagnostics import describe_probe_error
 
@@ -38,6 +39,58 @@ def test_parse_hdparm_state(output, expected):
 def test_drive_devices_reject_shell_input():
     with pytest.raises(ValueError):
         parse_drive_devices("/dev/sda; reboot")
+
+
+def hdparm_output(states):
+    """Return realistic multi-device hdparm output in supplied order."""
+    return "\n".join(
+        f"{device}:\n drive state is:  {state}" for device, state in states.items()
+    )
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        (
+            {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_ACTIVE},
+            {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_ACTIVE},
+        ),
+        (
+            {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_STANDBY},
+            {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_STANDBY},
+        ),
+        (
+            {"/dev/sdc": POWER_STANDBY, "/dev/sda": POWER_ACTIVE},
+            {"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_STANDBY},
+        ),
+        (
+            {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": POWER_ACTIVE},
+            {"/dev/sda": POWER_UNKNOWN, "/dev/sdc": POWER_ACTIVE},
+        ),
+    ],
+)
+def test_parse_multi_device_hdparm_output_by_exact_header(states, expected):
+    assert parse_hdparm_states(
+        hdparm_output(states), ("/dev/sda", "/dev/sdc")
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "/dev/sda:\n drive state is: active/idle",
+        "/dev/sda:\n drive state is: active/idle\n/dev/sda:\n drive state is: standby",
+        "/dev/sda:\n no state here\n/dev/sdc:\n drive state is: standby",
+        (
+            "/dev/sda:\n drive state is: active/idle\n drive state is: standby\n"
+            "/dev/sdc:\n drive state is: standby"
+        ),
+        "/dev/sda:\n drive state is: active/idle\n/dev/sdb:\n drive state is: standby",
+    ],
+)
+def test_parse_multi_device_hdparm_rejects_incomplete_or_ambiguous_output(output):
+    with pytest.raises(ValueError):
+        parse_hdparm_states(output, ("/dev/sda", "/dev/sdc"))
 
 
 class FakeConnection:
@@ -77,7 +130,7 @@ def use_connections(monkeypatch, *connections):
 @pytest.mark.asyncio
 async def test_probe_runs_only_fixed_hdparm_commands(monkeypatch):
     connection = FakeConnection(
-        ["drive state is: standby", "drive state is: active/idle"]
+        [hdparm_output({"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_ACTIVE})]
     )
     client = SSHPowerStateClient(
         "nas", 22, "root", "not-a-credential", ("/dev/sda", "/dev/sdc")
@@ -87,10 +140,7 @@ async def test_probe_runs_only_fixed_hdparm_commands(monkeypatch):
     states = await client.async_check()
 
     assert states == {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_ACTIVE}
-    assert connection.commands == [
-        "/usr/bin/hdparm -C /dev/sda",
-        "/usr/bin/hdparm -C /dev/sdc",
-    ]
+    assert connection.commands == ["/usr/bin/hdparm -C /dev/sda /dev/sdc"]
     assert connection.closed
     assert client._connection is None
 
@@ -106,7 +156,10 @@ async def start_local_server(key, commands):
     def handle_process(process):
         # Record the request, but never execute any command on the test host.
         commands.append(process.command)
-        process.stdout.write("drive state is: active/idle\n")
+        devices = process.command.split()[2:]
+        process.stdout.write(
+            hdparm_output({device: POWER_ACTIVE for device in devices}) + "\n"
+        )
         process.exit(0)
 
     return await asyncssh.listen(
@@ -140,9 +193,7 @@ async def test_real_asyncssh_tofu_then_pinned_reconnect():
         await client.async_check()
         assert client.fingerprint == pin
         assert client._connection is None
-        assert commands == [
-            "/usr/bin/hdparm -C /dev/sda", "/usr/bin/hdparm -C /dev/sdc",
-        ] * 2
+        assert commands == ["/usr/bin/hdparm -C /dev/sda /dev/sdc"] * 2
     finally:
         await client.async_close()
         server.close()
@@ -219,7 +270,7 @@ async def test_connect_preserves_classifiable_cause(monkeypatch, cause, expected
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_status,stdout,expected", [
     (127, "synthetic-private-detail", "command_failed"),
-    (1, "drive state is: active/idle", "command_failed"),
+    (1, "/dev/sda:\n drive state is: active/idle", "command_failed"),
     (0, "synthetic-private-detail", "parse_failed"),
 ])
 async def test_command_and_parser_failure_are_classified(
@@ -270,7 +321,7 @@ async def test_command_timeout_is_not_masked_by_cleanup_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_explicit_hdparm_unknown_is_not_a_parser_error(monkeypatch):
-    connection = FakeConnection(["drive state is: unknown"])
+    connection = FakeConnection([hdparm_output({"/dev/sda": POWER_UNKNOWN})])
     client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
     use_connections(monkeypatch, connection)
     assert await client.async_check() == {"/dev/sda": POWER_UNKNOWN}
@@ -281,8 +332,8 @@ async def test_explicit_hdparm_unknown_is_not_a_parser_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_two_probes_use_two_distinct_short_lived_connections(monkeypatch):
     connections = [
-        FakeConnection(["drive state is: active/idle"]),
-        FakeConnection(["drive state is: active/idle"]),
+        FakeConnection([hdparm_output({"/dev/sda": POWER_ACTIVE})]),
+        FakeConnection([hdparm_output({"/dev/sda": POWER_ACTIVE})]),
     ]
     use_connections(monkeypatch, *connections)
     client = SSHPowerStateClient(
@@ -298,6 +349,64 @@ async def test_two_probes_use_two_distinct_short_lived_connections(monkeypatch):
         ["/usr/bin/hdparm -C /dev/sda"],
         ["/usr/bin/hdparm -C /dev/sda"],
     ]
+    assert client._connection is None
+
+
+@pytest.mark.asyncio
+async def test_probe_succeeds_when_server_rejects_a_second_exec_channel(monkeypatch):
+    connection = FakeConnection(
+        [hdparm_output({"/dev/sda": POWER_ACTIVE, "/dev/sdc": POWER_STANDBY})]
+    )
+    calls = 0
+    original_run = connection.run
+
+    async def reject_second_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise asyncssh.ChannelOpenError(1, "second exec rejected")
+        return await original_run(*args, **kwargs)
+
+    connection.run = reject_second_run
+    use_connections(monkeypatch, connection)
+    client = SSHPowerStateClient(
+        "nas", 22, "test", "unused-test-value", ("/dev/sda", "/dev/sdc")
+    )
+
+    assert await client.async_check() == {
+        "/dev/sda": POWER_ACTIVE,
+        "/dev/sdc": POWER_STANDBY,
+    }
+    assert calls == 1
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_aborts_connection_and_fails_probe(monkeypatch):
+    never_closed = asyncio.Event()
+    connection = FakeConnection([hdparm_output({"/dev/sda": POWER_ACTIVE})])
+    connection.aborted = False
+
+    async def wait_closed():
+        await never_closed.wait()
+
+    def abort():
+        connection.aborted = True
+
+    connection.wait_closed = wait_closed
+    connection.abort = abort
+    use_connections(monkeypatch, connection)
+    client = SSHPowerStateClient(
+        "nas", 22, "test", "unused-test-value", ("/dev/sda",), timeout=0.01
+    )
+
+    with pytest.raises(PowerProbeError) as error:
+        await client.async_check()
+
+    failure = describe_probe_error(error.value)
+    assert failure.error_type == "timeout"
+    assert failure.stage == "cleanup"
+    assert connection.aborted
     assert client._connection is None
 
 
@@ -404,7 +513,9 @@ async def test_probe_lock_prevents_overlapping_commands(monkeypatch):
             await release.wait()
             active -= 1
             return SimpleNamespace(
-                exit_status=0, stdout="drive state is: active/idle", stderr=""
+                exit_status=0,
+                stdout=hdparm_output({"/dev/sda": POWER_ACTIVE}),
+                stderr="",
             )
 
     connections = [SlowConnection([]), SlowConnection([])]
@@ -424,7 +535,7 @@ async def test_probe_lock_prevents_overlapping_commands(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_connection_failure_gets_only_one_controlled_reconnect(monkeypatch):
+async def test_connection_failure_does_not_create_an_immediate_login_retry(monkeypatch):
     attempts = 0
 
     async def fail_connect(*args, **kwargs):
@@ -436,7 +547,7 @@ async def test_connection_failure_gets_only_one_controlled_reconnect(monkeypatch
     client = SSHPowerStateClient("nas", 22, "test", "unused-test-value", ("/dev/sda",))
     with pytest.raises(PowerProbeError):
         await client.async_check()
-    assert attempts == 2
+    assert attempts == 1
 
 
 @pytest.mark.asyncio
