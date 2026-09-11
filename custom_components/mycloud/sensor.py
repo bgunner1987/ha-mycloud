@@ -46,6 +46,119 @@ from .power_probe import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _entities_from_snapshot(coordinator: MyCloudDataUpdateCoordinator):
+    """Build entities only after device identity is available in a snapshot."""
+    device_info_data = coordinator.data["device_info"]
+    system_version_data = coordinator.data["system_version"]
+    serial_number = device_info_data["serial_number"]
+    device_name = device_info_data["name"]
+
+    device = DeviceInfo(
+        identifiers={(DOMAIN, serial_number)},
+        name=device_name,
+        manufacturer="Western Digital",
+        model=device_info_data["description"],
+        sw_version=system_version_data["firmware"],
+    )
+
+    sensors_to_add = [
+        MyCloudCPUSensor(coordinator, device, serial_number, device_name),
+        MyCloudMemorySensor(coordinator, device, serial_number, device_name),
+        MyCloudTotalStorageSensor(coordinator, device, serial_number, device_name),
+        MyCloudUsedStorageSensor(coordinator, device, serial_number, device_name),
+        MyCloudUnusedStorageSensor(coordinator, device, serial_number, device_name),
+    ]
+
+    disks = coordinator.data["system_info"]["disks"]
+    # Only validated configuration contributes command paths. API names are
+    # untrusted identifiers and must match a configured basename exactly.
+    configured_drives = {
+        path.rsplit("/", 1)[-1]: path for path in coordinator.drive_devices
+    }
+    for disk in disks:
+        api_name = disk.get("name")
+        drive_device = (
+            configured_drives.get(api_name) if isinstance(api_name, str) else None
+        )
+        if coordinator.power_client is not None and drive_device is None:
+            _LOGGER.debug("Ignoring API disk not present in configured drive devices")
+            continue
+        disk_serial = disk["sn"]
+        disk_name = f"{device_name} Disk {disk['name']}"
+        disk_model = disk["model"]
+
+        disk_device = DeviceInfo(
+            identifiers={(DOMAIN, disk_serial)},
+            name=disk_name,
+            manufacturer="Western Digital",
+            model=disk_model,
+            sw_version=system_version_data["firmware"],
+            hw_version=disk["rev"],
+            via_device=(DOMAIN, serial_number),
+        )
+
+        sensors_to_add.extend(
+            [
+                MyCloudDiskTempSensor(
+                    coordinator, disk_device, disk_serial, disk_name, disk
+                ),
+                MyCloudDiskHealthySensor(
+                    coordinator, disk_device, disk_serial, disk_name, disk
+                ),
+                MyCloudDiskSleepSensor(
+                    coordinator,
+                    disk_device,
+                    disk_serial,
+                    disk_name,
+                    disk,
+                    drive_device,
+                ),
+                MyCloudDiskFailedSensor(
+                    coordinator, disk_device, disk_serial, disk_name, disk
+                ),
+                MyCloudDiskOverTempSensor(
+                    coordinator, disk_device, disk_serial, disk_name, disk
+                ),
+                MyCloudDiskSizeSensor(
+                    coordinator, disk_device, disk_serial, disk_name, disk
+                ),
+            ]
+        )
+
+    volumes = coordinator.data["system_info"]["volumes"]
+    for volume in volumes:
+        volume_id = volume["id"]
+        volume_name = f"{device_name} {volume['label']}"
+
+        volume_device = DeviceInfo(
+            identifiers={(DOMAIN, volume_id)},
+            name=volume_name,
+            manufacturer="Western Digital",
+            model="Storage Volume",
+            via_device=(DOMAIN, serial_number),
+        )
+
+        sensors_to_add.extend(
+            [
+                MyCloudVolumeSizeSensor(
+                    coordinator, volume_device, volume_name, volume
+                ),
+                MyCloudVolumeMountedSensor(
+                    coordinator, volume_device, volume_name, volume
+                ),
+                MyCloudVolumeUnlockedSensor(
+                    coordinator, volume_device, volume_name, volume
+                ),
+                MyCloudVolumeEncryptedSensor(
+                    coordinator, volume_device, volume_name, volume
+                ),
+            ]
+        )
+
+    return sensors_to_add
+
+
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
     """Set up the WD My Cloud sensor platform."""
     host = config_entry.data[HOST]
@@ -113,104 +226,55 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         )),
         api_client_factory=api_client_factory,
     )
-    hass.data[DOMAIN][config_entry.entry_id].update(
+    resources = hass.data[DOMAIN][config_entry.entry_id]
+    resources.update(
         {"coordinator": coordinator, "async_close": coordinator.async_shutdown}
     )
 
+    if power_client is None:
+        try:
+            await coordinator.async_config_entry_first_refresh()
+        except Exception:
+            await coordinator.async_shutdown()
+            resources.clear()
+            raise
+        async_add_entities(_entities_from_snapshot(coordinator))
+        return
+
+    cached_data = coordinator.cached_setup_data()
+    remove_startup_listener = None
+    if cached_data is not None:
+        coordinator.async_set_updated_data(cached_data)
+    else:
+        # Device identifiers come from the WD snapshot. With no cache, defer
+        # entity construction until the first safely gated API snapshot instead
+        # of delaying platform setup or inventing unstable identifiers.
+        def add_entities_after_first_snapshot():
+            nonlocal remove_startup_listener
+            if coordinator.data is None:
+                return
+            if remove_startup_listener is not None:
+                remove_startup_listener()
+                remove_startup_listener = None
+            resources.pop("remove_startup_listener", None)
+            async_add_entities(_entities_from_snapshot(coordinator))
+
+        remove_startup_listener = coordinator.async_add_listener(
+            add_entities_after_first_snapshot
+        )
+        resources["remove_startup_listener"] = remove_startup_listener
+
     try:
-        await coordinator.async_config_entry_first_refresh()
+        coordinator.async_start_power_probe_loop()
     except Exception:
+        if remove_startup_listener is not None:
+            remove_startup_listener()
         await coordinator.async_shutdown()
-        hass.data[DOMAIN][config_entry.entry_id].clear()
+        resources.clear()
         raise
 
-    device_info_data = coordinator.data["device_info"]
-    system_version_data = coordinator.data["system_version"]
-    serial_number = device_info_data["serial_number"]
-    device_name = device_info_data["name"]
-
-    device = DeviceInfo(
-        identifiers={(DOMAIN, serial_number)},
-        name=device_name,
-        manufacturer="Western Digital",
-        model=device_info_data["description"],
-        sw_version=system_version_data["firmware"]
-    )
-
-    sensors_to_add = [
-        MyCloudCPUSensor(coordinator, device, serial_number, device_name),
-        MyCloudMemorySensor(coordinator, device, serial_number, device_name),
-        MyCloudTotalStorageSensor(coordinator, device, serial_number, device_name),
-        MyCloudUsedStorageSensor(coordinator, device, serial_number, device_name),
-        MyCloudUnusedStorageSensor(coordinator, device, serial_number, device_name)
-    ]
-
-    disks = coordinator.data["system_info"]["disks"]
-    # Only validated configuration contributes command paths. API names are
-    # untrusted identifiers and must match a configured basename exactly.
-    configured_drives = {
-        path.rsplit("/", 1)[-1]: path for path in coordinator.drive_devices
-    }
-    for disk in disks:
-        api_name = disk.get("name")
-        drive_device = (
-            configured_drives.get(api_name) if isinstance(api_name, str) else None
-        )
-        if power_client is not None and drive_device is None:
-            _LOGGER.debug("Ignoring API disk not present in configured drive devices")
-            continue
-        disk_serial = disk["sn"]
-        disk_name = f"{device_name} Disk {disk['name']}"
-        disk_model = disk["model"]
-
-        disk_device = DeviceInfo(
-            identifiers={(DOMAIN, disk_serial)},
-            name=disk_name,
-            manufacturer="Western Digital",
-            model=disk_model,
-            sw_version=system_version_data["firmware"],
-            hw_version=disk["rev"],
-            via_device=(DOMAIN, serial_number)
-        )
-
-        sensors_to_add.extend([
-            MyCloudDiskTempSensor(coordinator, disk_device, disk_serial, disk_name, disk),
-            MyCloudDiskHealthySensor(coordinator, disk_device, disk_serial, disk_name, disk),
-            MyCloudDiskSleepSensor(
-                coordinator,
-                disk_device,
-                disk_serial,
-                disk_name,
-                disk,
-                drive_device,
-            ),
-            MyCloudDiskFailedSensor(coordinator, disk_device, disk_serial, disk_name, disk),
-            MyCloudDiskOverTempSensor(coordinator, disk_device, disk_serial, disk_name, disk),
-            MyCloudDiskSizeSensor(coordinator, disk_device, disk_serial, disk_name, disk)
-        ])
-    
-    volumes = coordinator.data["system_info"]["volumes"]
-    for volume in volumes:
-        volume_id = volume["id"]
-        volume_name = f"{device_name} {volume['label']}"
-
-        volume_device = DeviceInfo(
-            identifiers={(DOMAIN, volume_id)},
-            name=volume_name,
-            manufacturer="Western Digital",
-            model="Storage Volume",
-            via_device=(DOMAIN, serial_number)
-        )
-
-        sensors_to_add.extend([
-            MyCloudVolumeSizeSensor(coordinator, volume_device, volume_name, volume),
-            MyCloudVolumeMountedSensor(coordinator, volume_device, volume_name, volume),
-            MyCloudVolumeUnlockedSensor(coordinator, volume_device, volume_name, volume),
-            MyCloudVolumeEncryptedSensor(coordinator, volume_device, volume_name, volume)
-        ])
-
-    async_add_entities(sensors_to_add)
-    coordinator.async_start_power_probe_loop()
+    if cached_data is not None:
+        async_add_entities(_entities_from_snapshot(coordinator))
 
 class MyCloudCachedEntity(CoordinatorEntity):
     """Expose cache freshness without changing entity identity or value."""

@@ -224,6 +224,12 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Expose the owned task for lifecycle tests."""
         return self._probe_task
 
+    def cached_setup_data(self) -> dict[str, Any] | None:
+        """Return a stale initial snapshot without performing any I/O."""
+        if self._cached_data is None:
+            return None
+        return self._cached_result(True)
+
     def async_start_power_probe_loop(self) -> None:
         """Start the single owned lightweight probe loop."""
         if self.power_client is None or self._closed or self._probe_task is not None:
@@ -545,7 +551,6 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_power_probe_loop(self) -> None:
         while True:
-            await self._sleep(self._power_probe_interval.total_seconds())
             try:
                 async with self._cycle_lock:
                     data, relevant = await self._async_sleep_aware_cycle()
@@ -562,6 +567,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 if relevant:
                     self.async_set_updated_data(data)
+            await self._sleep(self._power_probe_interval.total_seconds())
 
     async def async_shutdown(self) -> None:
         """Cancel the owned timer and close HTTP/SSH resources exactly once."""

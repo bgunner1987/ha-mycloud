@@ -68,6 +68,7 @@ class DataUpdateCoordinator:
         self.last_update_success = True
         self.updated_data_calls = 0
         self.update_error_calls = 0
+        self._listeners = []
 
     async def async_config_entry_first_refresh(self):
         self.data = await self.update_method()
@@ -79,10 +80,21 @@ class DataUpdateCoordinator:
         self.data = data
         self.last_update_success = True
         self.updated_data_calls += 1
+        for listener in tuple(self._listeners):
+            listener()
 
     def async_set_update_error(self, error):
         self.last_update_success = False
         self.update_error_calls += 1
+
+    def async_add_listener(self, update_callback, context=None):
+        self._listeners.append(update_callback)
+
+        def remove_listener():
+            if update_callback in self._listeners:
+                self._listeners.remove(update_callback)
+
+        return remove_listener
 
 
 config_entries.ConfigEntry = ConfigEntry

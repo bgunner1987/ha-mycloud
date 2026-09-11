@@ -47,6 +47,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     domain_data = hass.data.get(DOMAIN, {})
     resources = domain_data.pop(entry.entry_id, {})
+    remove_startup_listener = resources.get("remove_startup_listener")
+    if remove_startup_listener is not None:
+        remove_startup_listener()
     async_close = resources.get("async_close")
     if async_close is not None:
         await async_close()

@@ -16,10 +16,15 @@ from custom_components.mycloud.const import (
 @pytest.mark.asyncio
 async def test_config_entry_unload_closes_only_its_resources():
     closed = 0
+    listener_removed = 0
 
     async def close():
         nonlocal closed
         closed += 1
+
+    def remove_startup_listener():
+        nonlocal listener_removed
+        listener_removed += 1
 
     class ConfigEntries:
         async def async_unload_platforms(self, entry, platforms):
@@ -28,7 +33,10 @@ async def test_config_entry_unload_closes_only_its_resources():
     hass = SimpleNamespace(
         data={
             DOMAIN: {
-                "entry-1": {"async_close": close},
+                "entry-1": {
+                    "async_close": close,
+                    "remove_startup_listener": remove_startup_listener,
+                },
                 "entry-2": {"async_close": None},
             }
         },
@@ -38,6 +46,7 @@ async def test_config_entry_unload_closes_only_its_resources():
 
     assert await async_unload_entry(hass, entry) is True
     assert closed == 1
+    assert listener_removed == 1
     assert "entry-1" not in hass.data[DOMAIN]
     assert "entry-2" in hass.data[DOMAIN]
 

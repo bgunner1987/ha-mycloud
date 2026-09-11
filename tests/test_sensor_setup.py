@@ -43,15 +43,30 @@ def make_snapshot(names):
     }
 
 
-async def setup_platform(monkeypatch, snapshot, options):
+async def setup_platform(
+    monkeypatch,
+    snapshot,
+    options,
+    *,
+    cached=True,
+    power_check=None,
+    settle=True,
+):
     api = SimpleNamespace(
         __aenter__=AsyncMock(), __aexit__=AsyncMock(), session=None,
         **{key: AsyncMock(return_value=deepcopy(value)) for key, value in snapshot.items()},
     )
     store = SimpleNamespace(
-        async_load=AsyncMock(return_value={
-            "data": deepcopy(snapshot), "last_full_update": "2026-09-04T00:00:00+00:00",
-        }),
+        async_load=AsyncMock(
+            return_value=(
+                {
+                    "data": deepcopy(snapshot),
+                    "last_full_update": "2026-09-04T00:00:00+00:00",
+                }
+                if cached
+                else None
+            )
+        ),
         async_save=AsyncMock(),
     )
     monkeypatch.setattr(platform, "nas_client", lambda *args: api)
@@ -63,7 +78,11 @@ async def setup_platform(monkeypatch, snapshot, options):
             for device in client.drive_devices
         }
 
-    monkeypatch.setattr(platform.SSHPowerStateClient, "async_check", check_power)
+    monkeypatch.setattr(
+        platform.SSHPowerStateClient,
+        "async_check",
+        power_check or check_power,
+    )
     hass = SimpleNamespace(data={DOMAIN: {"test-entry": {}}})
 
     def create_background_task(_hass, coroutine, name):
@@ -78,7 +97,114 @@ async def setup_platform(monkeypatch, snapshot, options):
     entities = []
     await platform.async_setup_entry(hass, entry, entities.extend)
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    if settle:
+        await asyncio.sleep(0)
     return entities, coordinator, api
+
+
+@pytest.mark.asyncio
+async def test_sleep_aware_setup_does_not_wait_for_hanging_probe(monkeypatch):
+    probe_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def hanging_probe(_client):
+        probe_started.set()
+        await never_finish.wait()
+
+    entities, coordinator, api = await asyncio.wait_for(
+        setup_platform(
+            monkeypatch,
+            make_snapshot(["sda", "sdc"]),
+            {
+                CONF_SLEEP_AWARE_ENABLED: True,
+                CONF_DRIVE_DEVICES: "/dev/sda,/dev/sdc",
+                CONF_UPDATE_INTERVAL: 600,
+            },
+            power_check=hanging_probe,
+            settle=False,
+        ),
+        timeout=0.1,
+    )
+    try:
+        assert entities
+        assert coordinator.data["data_stale"] is True
+        await asyncio.wait_for(probe_started.wait(), timeout=0.1)
+        assert not coordinator.power_probe_task.done()
+        for key in make_snapshot([]):
+            getattr(api, key).assert_not_awaited()
+    finally:
+        await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sleep_aware_setup_without_cache_starts_cleanly(monkeypatch):
+    probe_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def hanging_probe(_client):
+        probe_started.set()
+        await never_finish.wait()
+
+    entities, coordinator, api = await asyncio.wait_for(
+        setup_platform(
+            monkeypatch,
+            make_snapshot(["sda", "sdc"]),
+            {
+                CONF_SLEEP_AWARE_ENABLED: True,
+                CONF_DRIVE_DEVICES: "/dev/sda,/dev/sdc",
+                CONF_UPDATE_INTERVAL: 600,
+            },
+            cached=False,
+            power_check=hanging_probe,
+            settle=False,
+        ),
+        timeout=0.1,
+    )
+    try:
+        # Entity identifiers depend on the first real device snapshot, so the
+        # platform loads now and adds them later without inventing identities.
+        assert entities == []
+        assert coordinator.data is None
+        await asyncio.wait_for(probe_started.wait(), timeout=0.1)
+        assert not coordinator.power_probe_task.done()
+        for key in make_snapshot([]):
+            getattr(api, key).assert_not_awaited()
+    finally:
+        task = coordinator.power_probe_task
+        await coordinator.async_shutdown()
+        assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_first_safe_snapshot_adds_deferred_entities_without_cache(monkeypatch):
+    async def active_probe(client):
+        return dict.fromkeys(client.drive_devices, POWER_ACTIVE)
+
+    entities, coordinator, api = await setup_platform(
+        monkeypatch,
+        make_snapshot(["sda", "sdc"]),
+        {
+            CONF_SLEEP_AWARE_ENABLED: True,
+            CONF_DRIVE_DEVICES: "/dev/sda,/dev/sdc",
+            CONF_UPDATE_INTERVAL: 600,
+        },
+        cached=False,
+        power_check=active_probe,
+    )
+    try:
+        for _ in range(10):
+            if entities:
+                break
+            await asyncio.sleep(0)
+        assert entities
+        assert coordinator.data["data_stale"] is False
+        assert "remove_startup_listener" not in coordinator.hass.data[DOMAIN][
+            "test-entry"
+        ]
+        for key in make_snapshot([]):
+            getattr(api, key).assert_awaited_once()
+    finally:
+        await coordinator.async_shutdown()
 
 
 @pytest.mark.asyncio

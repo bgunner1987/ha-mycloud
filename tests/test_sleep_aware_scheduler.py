@@ -300,7 +300,7 @@ async def test_unchanged_ten_second_probes_do_not_notify_or_write_cache():
     saves = len(store.saved)
     with pytest.raises(asyncio.CancelledError):
         await coordinator._async_power_probe_loop()
-    assert probe.calls == 3
+    assert probe.calls == 4
     assert api.calls.count("system_info") == 1
     assert len(store.saved) == saves
     assert coordinator.updated_data_calls == 0
