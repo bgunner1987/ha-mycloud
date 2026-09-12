@@ -51,7 +51,9 @@ def test_real_exception_classification_is_safe(cause, expected, caplog):
     assert record.exc_info is None
     assert SECRET not in caplog.text
     assert SECRET not in json.dumps(failure.__dict__)
-    assert record.args == (expected, "connect")
+    assert record.args == (
+        expected, "connect", "hdparm_power_state", None, 0,
+    )
 
 
 def test_implicit_context_and_all_chain_nodes_are_sanitized(caplog):
@@ -95,10 +97,35 @@ def test_changed_safe_cause_has_new_signature_but_secret_text_does_not():
 def test_structured_fields_cannot_inject_secrets():
     failure = describe_probe_error(PowerProbeError(
         SECRET, stage=SECRET, error_type=SECRET, detail=SECRET, exit_status=SECRET,
+        duration_seconds=-1, probe_type=SECRET,
     ))
     assert SECRET not in failure.summary
     assert failure.stage == "probe"
     assert failure.error_type == "connection_failed"
+    assert failure.probe_type == "hdparm_power_state"
+    assert failure.duration_seconds is None
+
+
+def test_command_timeout_logging_escalates_on_third_consecutive_failure(caplog):
+    failure = describe_probe_error(PowerProbeError(
+        SECRET,
+        stage="command",
+        error_type="timeout",
+        detail="command_timeout",
+        duration_seconds=10.0049,
+    ))
+
+    with caplog.at_level(logging.DEBUG):
+        for streak in (1, 2, 3):
+            log_probe_failure(logging.getLogger("test.probe"), failure, streak)
+
+    assert [record.levelno for record in caplog.records] == [
+        logging.DEBUG, logging.DEBUG, logging.WARNING,
+    ]
+    assert failure.duration_seconds == 10.005
+    assert "probe=hdparm_power_state" in failure.summary
+    assert SECRET not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_structured_connection_causes_are_distinguishable_without_raw_reasons():

@@ -93,10 +93,32 @@ def test_parse_multi_device_hdparm_rejects_incomplete_or_ambiguous_output(output
         parse_hdparm_states(output, ("/dev/sda", "/dev/sdc"))
 
 
+class FakeProcess:
+    def __init__(self, connection, command):
+        self.connection = connection
+        self.command = command
+        self.closed = False
+        self.terminated = False
+        self.wait_closed_called = False
+
+    async def wait(self, check=False):
+        return await self.connection.run(self.command, check=check)
+
+    def terminate(self):
+        self.terminated = True
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        self.wait_closed_called = True
+
+
 class FakeConnection:
     def __init__(self, outputs):
         self.outputs = iter(outputs)
         self.commands = []
+        self.processes = []
         self.closed = False
 
     def is_closed(self):
@@ -109,6 +131,11 @@ class FakeConnection:
             stdout=next(self.outputs),
             stderr="",
         )
+
+    async def create_process(self, command):
+        process = FakeProcess(self, command)
+        self.processes.append(process)
+        return process
 
     def close(self):
         self.closed = True
@@ -142,7 +169,11 @@ async def test_probe_runs_only_fixed_hdparm_commands(monkeypatch):
     assert states == {"/dev/sda": POWER_STANDBY, "/dev/sdc": POWER_ACTIVE}
     assert connection.commands == ["/usr/bin/hdparm -C /dev/sda /dev/sdc"]
     assert connection.closed
+    assert connection.processes[0].closed
+    assert connection.processes[0].wait_closed_called
+    assert not connection.processes[0].terminated
     assert client._connection is None
+    assert client._process is None
 
 
 class LocalSSHServer(asyncssh.SSHServer):
@@ -316,7 +347,51 @@ async def test_command_timeout_is_not_masked_by_cleanup_error(monkeypatch):
     failure = describe_probe_error(error.value)
     assert failure.error_type == "timeout"
     assert failure.stage == "command"
+    assert failure.probe_type == "hdparm_power_state"
+    assert failure.duration_seconds is not None
     assert "synthetic-private" not in failure.summary
+    assert connection.processes[0].closed
+    assert connection.processes[0].wait_closed_called
+    assert client._process is None
+
+
+@pytest.mark.asyncio
+async def test_hanging_command_timeout_cancels_wait_and_closes_all_resources(
+    monkeypatch,
+):
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    connection = FakeConnection([])
+
+    async def run(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    connection.run = run
+    client = SSHPowerStateClient(
+        "nas", 22, "test", "unused-test-value", ("/dev/sda",), timeout=0.01
+    )
+    use_connections(monkeypatch, connection)
+
+    with pytest.raises(PowerProbeError) as error:
+        await client.async_check()
+
+    failure = describe_probe_error(error.value)
+    process = connection.processes[0]
+    assert entered.is_set()
+    assert cancelled.is_set()
+    assert failure.error_type == "timeout"
+    assert failure.stage == "command"
+    assert failure.duration_seconds is not None
+    assert process.terminated
+    assert process.closed
+    assert process.wait_closed_called
+    assert connection.closed
+    assert client._process is None
+    assert client._connection is None
 
 
 @pytest.mark.asyncio
@@ -432,7 +507,9 @@ async def test_cancellation_closes_probe_connection(monkeypatch):
         await task
 
     assert connection.closed
+    assert connection.processes[0].closed
     assert client._connection is None
+    assert client._process is None
 
 
 @pytest.mark.asyncio

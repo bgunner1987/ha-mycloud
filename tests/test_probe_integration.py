@@ -42,6 +42,27 @@ class ErrorProbe(FakeProbe):
         return dict(self.states)
 
 
+class CommandTimeoutProbe(FakeProbe):
+    def __init__(self, states):
+        super().__init__(states)
+        self.timed_out = False
+
+    async def async_check(self):
+        self.checks += 1
+        if self.timed_out:
+            try:
+                raise TimeoutError(SECRET)
+            except TimeoutError as err:
+                raise PowerProbeError(
+                    SECRET,
+                    stage="command",
+                    error_type="timeout",
+                    detail="command_timeout",
+                    duration_seconds=10.004,
+                ) from err
+        return dict(self.states)
+
+
 def warnings(caplog):
     return [
         record for record in caplog.records
@@ -73,11 +94,15 @@ async def test_error_diagnostics_on_available_system_sensors(cause, expected, ca
             attrs = entity.extra_state_attributes
             assert attrs["power_probe_status"] == "error"
             assert attrs["power_probe_error_type"] == expected
+            assert attrs["power_probe_error_stage"] == "connect"
+            assert attrs["power_probe_error_duration_seconds"] is None
+            assert attrs["power_probe_type"] == "hdparm_power_state"
             assert attrs["last_power_check"] == coordinator.last_power_check
             assert attrs["last_power_check"] is not None
             assert attrs["last_successful_power_check"] is None
             assert attrs["last_conclusive_power_check"] is None
             assert attrs["consecutive_probe_failures"] == failure_count
+            assert attrs["consecutive_command_timeouts"] == 0
             assert attrs["power_states"] == dict.fromkeys(probe.drive_devices, POWER_UNKNOWN)
             assert attrs["raw_power_states"] == attrs["power_states"]
             assert attrs["last_confirmed_power_states"] == {}
@@ -104,39 +129,61 @@ async def test_error_diagnostics_on_available_system_sensors(cause, expected, ca
 @pytest.mark.asyncio
 async def test_repeated_timeout_keeps_confirmed_state_but_api_gate_stays_closed(caplog):
     api = FakeAPI()
-    probe = ErrorProbe(None)
+    probe = CommandTimeoutProbe(ALL_ACTIVE)
     coordinator, _ = make_coordinator(api, probe)
     sleeping = MyCloudDiskSleepSensor(
         coordinator, {}, "test", "Disk", {"name": "1"}, "/dev/sda"
     )
 
-    coordinator.data = await coordinator._async_update_data()
+    with caplog.at_level(logging.DEBUG):
+        coordinator.data = await coordinator._async_update_data()
     first_success = coordinator.last_successful_power_check
     api_calls_after_success = list(api.calls)
     assert sleeping.available
     assert sleeping.is_on is False
 
-    probe.cause = TimeoutError(SECRET)
-    coordinator.data = await coordinator._async_update_data()
+    probe.timed_out = True
+    with caplog.at_level(logging.DEBUG):
+        coordinator.data = await coordinator._async_update_data()
     assert coordinator.power_states == dict.fromkeys(
         probe.drive_devices, POWER_UNKNOWN
     )
     assert coordinator.power_probe_status == "error"
     assert coordinator.consecutive_probe_failures == 1
+    assert coordinator.consecutive_command_timeouts == 1
     assert coordinator.last_successful_power_check == first_success
     assert sleeping.available
     assert sleeping.is_on is False
     assert api.calls == api_calls_after_success
 
-    coordinator.data = await coordinator._async_update_data()
+    with caplog.at_level(logging.DEBUG):
+        coordinator.data = await coordinator._async_update_data()
     assert coordinator.consecutive_probe_failures == 2
+    assert coordinator.consecutive_command_timeouts == 2
     assert sleeping.available
     assert sleeping.is_on is False
     assert coordinator.power_probe_diagnostics["api_block_reason"] == "probe_error"
     assert api.calls == api_calls_after_success
-    assert len(warnings(caplog)) == 1
+    assert len(warnings(caplog)) == 0
 
-    probe.cause = None
+    with caplog.at_level(logging.DEBUG):
+        coordinator.data = await coordinator._async_update_data()
+    assert coordinator.consecutive_command_timeouts == 3
+    assert len(warnings(caplog)) == 1
+    timeout_records = [
+        record for record in caplog.records
+        if record.name == "test" and "consecutive_command_timeouts" in record.message
+    ]
+    assert [record.levelno for record in timeout_records] == [
+        logging.DEBUG, logging.DEBUG, logging.WARNING,
+    ]
+    diagnostics = coordinator.power_probe_diagnostics
+    assert diagnostics["power_probe_error_stage"] == "command"
+    assert diagnostics["power_probe_error_duration_seconds"] == 10.004
+    assert diagnostics["power_probe_type"] == "hdparm_power_state"
+    assert SECRET not in json.dumps(diagnostics)
+
+    probe.timed_out = False
     probe.states = BLOCKED_STATES[0]
     coordinator.data = await coordinator._async_update_data()
     assert sleeping.available
@@ -145,6 +192,7 @@ async def test_repeated_timeout_keeps_confirmed_state_but_api_gate_stays_closed(
     assert coordinator.power_probe_error_type is None
     assert coordinator.last_power_probe_error is None
     assert coordinator.consecutive_probe_failures == 0
+    assert coordinator.consecutive_command_timeouts == 0
     assert coordinator.last_successful_power_check is not None
     assert api.calls == api_calls_after_success
 
@@ -470,12 +518,17 @@ async def test_legacy_mode_diagnostics_are_disabled():
         "last_successful_power_check": None,
         "last_conclusive_power_check": None,
         "consecutive_probe_failures": 0,
+        "consecutive_command_timeouts": 0,
         "power_states": {},
         "raw_power_states": {},
         "last_confirmed_power_states": {},
         "power_state_stale": None,
         "power_probe_status": "disabled",
-        "power_probe_error_type": None, "last_power_probe_error": None,
+        "power_probe_error_type": None,
+        "power_probe_error_stage": None,
+        "power_probe_error_duration_seconds": None,
+        "power_probe_type": None,
+        "last_power_probe_error": None,
         "api_poll_allowed": True,
         "api_block_reason": None,
     }

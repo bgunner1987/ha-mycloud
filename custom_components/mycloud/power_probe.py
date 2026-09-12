@@ -138,6 +138,8 @@ class SSHPowerStateClient:
         self._observed_fingerprint: str | None = None
         self._timeout = timeout
         self._connection: Any | None = None
+        self._process: Any | None = None
+        self._process_running = False
         self._probe_lock = asyncio.Lock()
 
     @property
@@ -154,6 +156,7 @@ class SSHPowerStateClient:
         self._observed_fingerprint = fingerprint
 
     async def _async_connect(self):
+        started = asyncio.get_running_loop().time()
         validator = _PinnedSSHClient(
             self._expected_fingerprint,
             self._fingerprint_seen,
@@ -180,6 +183,7 @@ class SSHPowerStateClient:
             raise PowerProbeError(
                 "SSH connection or host-key validation failed",
                 stage="connect", detail="connect_failed",
+                duration_seconds=asyncio.get_running_loop().time() - started,
             ) from err
 
         self._connection = connection
@@ -197,15 +201,38 @@ class SSHPowerStateClient:
         try:
             connection = await self._async_connect()
             command = f"{HDPARM_PATH} -C {' '.join(self._drive_devices)}"
-            result = await asyncio.wait_for(
-                connection.run(command, check=False),
-                timeout=self._timeout,
-            )
+            started = asyncio.get_running_loop().time()
+
+            async def run_command():
+                self._process = await connection.create_process(command)
+                self._process_running = True
+                result = await self._process.wait(check=False)
+                self._process_running = False
+                return result
+
+            try:
+                # One budget covers both opening the exec channel and waiting for
+                # hdparm. On timeout, async_close() explicitly terminates and closes
+                # the retained process before closing the SSH connection.
+                result = await asyncio.wait_for(run_command(), timeout=self._timeout)
+            except TimeoutError as err:
+                raise PowerProbeError(
+                    "SSH power-state command timed out",
+                    stage="command",
+                    error_type="timeout",
+                    detail="command_timeout",
+                    duration_seconds=(
+                        asyncio.get_running_loop().time() - started
+                    ),
+                ) from err
             if result.exit_status != 0:
                 raise PowerProbeError(
                     "SSH power-state command failed", stage="command",
                     error_type="command_failed", detail="nonzero_exit",
                     exit_status=result.exit_status,
+                    duration_seconds=(
+                        asyncio.get_running_loop().time() - started
+                    ),
                 )
             output = f"{result.stdout or ''}\n{result.stderr or ''}"
             try:
@@ -214,6 +241,9 @@ class SSHPowerStateClient:
                 raise PowerProbeError(
                     "Unrecognized hdparm response", stage="command",
                     error_type="parse_failed", detail="unrecognized_hdparm_output",
+                    duration_seconds=(
+                        asyncio.get_running_loop().time() - started
+                    ),
                 ) from err
         except (PowerProbeError, asyncio.CancelledError) as err:
             failure = err
@@ -260,8 +290,41 @@ class SSHPowerStateClient:
             return await self._async_check_once()
 
     async def async_close(self) -> None:
-        """Close the current SSH connection, if any."""
+        """Boundedly terminate the current exec channel and SSH connection."""
+        process, self._process = self._process, None
+        process_running, self._process_running = self._process_running, False
         connection, self._connection = self._connection, None
+        cleanup_failure: PowerProbeError | None = None
+
+        if process is not None:
+            try:
+                terminate = getattr(process, "terminate", None)
+                if process_running and callable(terminate):
+                    try:
+                        terminate()
+                    except (OSError, asyncssh.Error):
+                        # Some embedded SSH servers don't support process signals.
+                        # Closing the channel and connection remains authoritative.
+                        pass
+                process.close()
+                await asyncio.wait_for(
+                    process.wait_closed(), timeout=self._timeout
+                )
+            except TimeoutError as err:
+                cleanup_failure = PowerProbeError(
+                    "SSH process cleanup timed out", stage="cleanup",
+                    error_type="timeout", detail="process_cleanup_timeout",
+                )
+                cleanup_failure.__cause__ = err
+                cleanup_failure.__suppress_context__ = True
+            except Exception as err:  # noqa: BLE001 - normalize SSH cleanup
+                cleanup_failure = PowerProbeError(
+                    "SSH process cleanup failed", stage="cleanup",
+                    error_type="connection_failed", detail="cleanup_failed",
+                )
+                cleanup_failure.__cause__ = err
+                cleanup_failure.__suppress_context__ = True
+
         if connection is not None:
             connection.close()
             try:
@@ -272,7 +335,21 @@ class SSHPowerStateClient:
                 abort = getattr(connection, "abort", None)
                 if callable(abort):
                     abort()
-                raise PowerProbeError(
+                connection_failure = PowerProbeError(
                     "SSH connection cleanup timed out", stage="cleanup",
                     error_type="timeout", detail="cleanup_timeout",
-                ) from err
+                )
+                connection_failure.__cause__ = err
+                connection_failure.__suppress_context__ = True
+                cleanup_failure = cleanup_failure or connection_failure
+            except Exception as err:  # noqa: BLE001 - normalize SSH cleanup
+                connection_failure = PowerProbeError(
+                    "SSH connection cleanup failed", stage="cleanup",
+                    error_type="connection_failed", detail="cleanup_failed",
+                )
+                connection_failure.__cause__ = err
+                connection_failure.__suppress_context__ = True
+                cleanup_failure = cleanup_failure or connection_failure
+
+        if cleanup_failure is not None:
+            raise cleanup_failure

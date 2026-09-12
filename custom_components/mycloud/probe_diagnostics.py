@@ -6,7 +6,7 @@ import asyncio
 import errno
 import logging
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import asyncssh
 
@@ -16,15 +16,25 @@ _ERROR_TYPES = {
 }
 _DETAILS = {
     "probe_failed", "connect_failed", "command_failed", "nonzero_exit",
-    "unrecognized_hdparm_output", "cleanup_timeout", "cleanup_failed",
+    "command_timeout", "unrecognized_hdparm_output", "cleanup_timeout",
+    "process_cleanup_timeout", "cleanup_failed",
 }
+_PROBE_TYPES = {"hdparm_power_state"}
 
 
 class PowerProbeError(Exception):
     """Carry structured operation context; the message is never logged directly."""
 
     def __init__(
-        self, message: str, *, stage="probe", error_type=None, detail=None, exit_status=None
+        self,
+        message: str,
+        *,
+        stage="probe",
+        error_type=None,
+        detail=None,
+        exit_status=None,
+        duration_seconds=None,
+        probe_type="hdparm_power_state",
     ):
         super().__init__(message)
         self.stage = (
@@ -35,6 +45,14 @@ class PowerProbeError(Exception):
         self.exit_status = (
             exit_status if type(exit_status) is int and 0 <= exit_status <= 255 else None
         )
+        self.duration_seconds = (
+            round(duration_seconds, 3)
+            if type(duration_seconds) in (int, float) and duration_seconds >= 0
+            else None
+        )
+        self.probe_type = (
+            probe_type if probe_type in _PROBE_TYPES else "hdparm_power_state"
+        )
 
 
 @dataclass(frozen=True)
@@ -44,10 +62,16 @@ class ProbeFailure:
     error_type: str
     stage: str
     chain: tuple[str, ...]
+    probe_type: str = "hdparm_power_state"
+    # Timings are useful diagnostics but must not defeat identical-error deduplication.
+    duration_seconds: float | None = field(default=None, compare=False)
 
     @property
     def summary(self) -> str:
-        return f"{self.error_type}; stage={self.stage}; " + " <- ".join(self.chain)
+        return (
+            f"{self.error_type}; stage={self.stage}; probe={self.probe_type}; "
+            + " <- ".join(self.chain)
+        )
 
 
 def _describe(error: BaseException) -> tuple[str | None, str]:
@@ -133,13 +157,35 @@ def describe_probe_error(error: PowerProbeError) -> ProbeFailure:
             None if current.__suppress_context__ else current.__context__
         )
     fallback = "command_failed" if error.stage == "command" else "connection_failed"
-    return ProbeFailure(categories[-1] if categories else fallback, error.stage, tuple(chain))
+    return ProbeFailure(
+        categories[-1] if categories else fallback,
+        error.stage,
+        tuple(chain),
+        error.probe_type,
+        error.duration_seconds,
+    )
 
 
-def log_probe_failure(logger: logging.Logger, failure: ProbeFailure) -> None:
-    """Log one concise allowlisted warning without raw exception tracebacks."""
-    logger.warning(
-        "SSH power probe failed (%s, stage=%s); WD API blocked for this cycle",
+def log_probe_failure(
+    logger: logging.Logger,
+    failure: ProbeFailure,
+    consecutive_command_timeouts: int = 0,
+) -> None:
+    """Log safe diagnostics, escalating repeated command timeouts to warning."""
+    is_command_timeout = (
+        failure.error_type == "timeout" and failure.stage == "command"
+    )
+    log = (
+        logger.debug
+        if is_command_timeout and consecutive_command_timeouts < 3
+        else logger.warning
+    )
+    log(
+        "SSH power probe failed (%s, stage=%s, probe=%s, duration_seconds=%s, "
+        "consecutive_command_timeouts=%d); WD API blocked for this cycle",
         failure.error_type,
         failure.stage,
+        failure.probe_type,
+        failure.duration_seconds,
+        consecutive_command_timeouts,
     )

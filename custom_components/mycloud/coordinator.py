@@ -118,8 +118,14 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_confirmed_power_states: dict[str, str] = {}
         self.power_probe_status = "pending" if power_client else "disabled"
         self.power_probe_error_type: str | None = None
+        self.power_probe_error_stage: str | None = None
+        self.power_probe_error_duration_seconds: float | None = None
+        self.power_probe_type: str | None = (
+            "hdparm_power_state" if power_client else None
+        )
         self.last_power_probe_error: str | None = None
         self.consecutive_probe_failures = 0
+        self.consecutive_command_timeouts = 0
         self._last_logged_probe_failure: ProbeFailure | None = None
         self._wake_poll_pending = True
         self._last_api_attempt_at: str | None = None
@@ -140,6 +146,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_successful_power_check": self.last_successful_power_check,
             "last_conclusive_power_check": self.last_conclusive_power_check,
             "consecutive_probe_failures": self.consecutive_probe_failures,
+            "consecutive_command_timeouts": self.consecutive_command_timeouts,
             "power_states": dict(self.power_states),
             "raw_power_states": dict(self.power_states),
             "last_confirmed_power_states": dict(
@@ -148,6 +155,11 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "power_state_stale": self.power_state_stale,
             "power_probe_status": self.power_probe_status,
             "power_probe_error_type": self.power_probe_error_type,
+            "power_probe_error_stage": self.power_probe_error_stage,
+            "power_probe_error_duration_seconds": (
+                self.power_probe_error_duration_seconds
+            ),
+            "power_probe_type": self.power_probe_type,
             "last_power_probe_error": self.last_power_probe_error,
             "api_poll_allowed": self.api_poll_allowed,
             "api_block_reason": self.api_block_reason,
@@ -365,6 +377,8 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             self.power_probe_status,
             self.power_probe_error_type,
+            self.power_probe_error_stage,
+            min(self.consecutive_command_timeouts, 3),
             self.last_power_probe_error,
             self.last_api_attempt_status,
             self.last_api_error_type,
@@ -391,12 +405,29 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _record_probe_failure(self, err: PowerProbeError) -> None:
         failure = describe_probe_error(err)
         self.consecutive_probe_failures += 1
+        is_command_timeout = (
+            failure.error_type == "timeout" and failure.stage == "command"
+        )
+        self.consecutive_command_timeouts = (
+            self.consecutive_command_timeouts + 1 if is_command_timeout else 0
+        )
         self.power_states = dict.fromkeys(self.drive_devices, POWER_UNKNOWN)
         self.power_probe_status = "error"
         self.power_probe_error_type = failure.error_type
+        self.power_probe_error_stage = failure.stage
+        self.power_probe_error_duration_seconds = failure.duration_seconds
+        self.power_probe_type = failure.probe_type
         self.last_power_probe_error = failure.summary
-        if failure != self._last_logged_probe_failure:
-            log_probe_failure(self._integration_logger, failure)
+        should_log = (
+            failure != self._last_logged_probe_failure
+            or (is_command_timeout and self.consecutive_command_timeouts <= 3)
+        )
+        if should_log:
+            log_probe_failure(
+                self._integration_logger,
+                failure,
+                self.consecutive_command_timeouts,
+            )
             self._last_logged_probe_failure = failure
 
     def _record_probe_success(self, states: dict[str, str], check_time: str) -> None:
@@ -412,12 +443,15 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         previous_failures = self.consecutive_probe_failures
         self.last_successful_power_check = check_time
         self.consecutive_probe_failures = 0
+        self.consecutive_command_timeouts = 0
         self.power_probe_status = (
             "unknown"
             if any(state == POWER_UNKNOWN for state in self.power_states.values())
             else "ok"
         )
         self.power_probe_error_type = None
+        self.power_probe_error_stage = None
+        self.power_probe_error_duration_seconds = None
         self.last_power_probe_error = None
         for device, state in self.power_states.items():
             if state in _KNOWN_POWER_STATES:
