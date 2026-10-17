@@ -87,6 +87,10 @@ class DataUpdateCoordinator:
         self.last_update_success = False
         self.update_error_calls += 1
 
+    def async_update_listeners(self):
+        for listener in tuple(self._listeners):
+            listener()
+
     def async_add_listener(self, update_callback, context=None):
         self._listeners.append(update_callback)
 
@@ -111,6 +115,7 @@ binary_sensor.BinarySensorEntity = type("BinarySensorEntity", (), {})
 const.UnitOfTemperature = types.SimpleNamespace(CELSIUS="°C")
 const.UnitOfInformation = types.SimpleNamespace(BYTES="B", TERABYTES="TB")
 entity.DeviceInfo = lambda **kwargs: kwargs
+entity.EntityCategory = types.SimpleNamespace(DIAGNOSTIC="diagnostic")
 storage.Store = type("Store", (), {})
 selector.TextSelector = lambda config=None: str
 selector.TextSelectorConfig = lambda **kwargs: kwargs

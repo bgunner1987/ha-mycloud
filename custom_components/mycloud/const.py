@@ -1,4 +1,5 @@
 DOMAIN = "mycloud"
+INTEGRATION_VERSION = "1.3.12"
 
 HOST = "Host"
 USERNAME = "Username"

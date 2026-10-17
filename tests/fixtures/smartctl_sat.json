@@ -1,0 +1,10 @@
+{
+  "provenance": "IDLE_A state text and CHECK POWER MODE evidence were supplied by the user for smartctl 7.2. Other cases are synthetic protocol regressions, not NAS captures.",
+  "idle_a": {"output": "smartctl 7.2\nDevice is in IDLE_A mode\n", "exit_status": 0},
+  "idle_a_stderr": {"output": "Device is in IDLE_A mode", "exit_status": 0, "stderr": true},
+  "standby": {"output": "Device is in STANDBY mode, exit(3)\n", "exit_status": 3},
+  "unknown": {"output": "CHECK POWER MODE returned unknown value 0x42, ignoring -n option\n", "exit_status": 0},
+  "command_failed": {"output": "synthetic-private-output\n", "exit_status": 2},
+  "missing": {"output": "", "exit_status": 2, "missing": true},
+  "program_missing": {"output": "", "exit_status": 127, "program_missing": true}
+}

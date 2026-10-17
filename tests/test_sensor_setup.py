@@ -185,7 +185,11 @@ async def test_sleep_aware_setup_without_cache_starts_cleanly(monkeypatch):
     try:
         # Entity identifiers depend on the first real device snapshot, so the
         # platform loads now and adds them later without inventing identities.
-        assert entities == []
+        assert len(entities) == 1
+        diagnostic = entities[0]
+        assert isinstance(diagnostic, platform.MyCloudProbeDiagnosticSensor)
+        assert diagnostic.available
+        assert diagnostic.extra_state_attributes["has_api_cache"] is False
         assert coordinator.data is None
         await asyncio.wait_for(probe_started.wait(), timeout=0.1)
         assert not coordinator.power_probe_task.done()
@@ -215,7 +219,7 @@ async def test_first_safe_snapshot_adds_deferred_entities_without_cache(monkeypa
     )
     try:
         for _ in range(10):
-            if entities:
+            if any(isinstance(e, platform.MyCloudCPUSensor) for e in entities):
                 break
             await asyncio.sleep(0)
         assert entities

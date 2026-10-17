@@ -112,14 +112,13 @@ def smartctl_output(results):
 def test_build_smartctl_command_uses_only_validated_paths():
     command = build_smartctl_command(("/dev/sda", "/dev/sdb"))
 
-    assert command == (
-        "printf '__MYCLOUD_DISK__ /dev/sda\\n'\n"
-        "LC_ALL=C smartctl -d sat -n standby,3 /dev/sda 2>&1\n"
-        "printf '__MYCLOUD_STATUS__ %s\\n' \"$?\"\n"
-        "printf '__MYCLOUD_DISK__ /dev/sdb\\n'\n"
-        "LC_ALL=C smartctl -d sat -n standby,3 /dev/sdb 2>&1\n"
-        "printf '__MYCLOUD_STATUS__ %s\\n' \"$?\""
-    )
+    for device in ("/dev/sda", "/dev/sdb"):
+        assert f'"$mycloud_smartctl" -d sat -n standby,3 {device} 2>&1' in command
+        assert f"test -b {device}" in command
+        assert f"__MYCLOUD_DISK__ {device}" in command
+    assert "/usr/sbin/smartctl /usr/bin/smartctl /sbin/smartctl /bin/smartctl" in command
+    assert 'else mycloud_status=$?; fi' in command
+    assert "\r" not in command
     assert " -a " not in command
     assert " --scan" not in command
     with pytest.raises(ValueError):

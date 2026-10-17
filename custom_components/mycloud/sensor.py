@@ -10,7 +10,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfInformation, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from wdnas_client import client as nas_client
@@ -230,6 +230,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL
         )),
         api_client_factory=api_client_factory,
+        configured_probe_method=config_entry.options.get(
+            CONF_POWER_PROBE_METHOD, DEFAULT_POWER_PROBE_METHOD
+        ),
     )
     resources = hass.data[DOMAIN][config_entry.entry_id]
     resources.update(
@@ -246,6 +249,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         async_add_entities(_entities_from_snapshot(coordinator))
         return
 
+    # Entry-scoped identity is stable even before the NAS serial is known.
+    async_add_entities([MyCloudProbeDiagnosticSensor(coordinator, config_entry.entry_id)])
     cached_data = coordinator.cached_setup_data()
     remove_startup_listener = None
     if cached_data is not None:
@@ -281,6 +286,34 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     if cached_data is not None:
         async_add_entities(_entities_from_snapshot(coordinator))
 
+class MyCloudProbeDiagnosticSensor(CoordinatorEntity, SensorEntity):
+    """Always available, including blocked first setup with no NAS snapshot."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:harddisk"
+
+    def __init__(self, coordinator, entry_id):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry_id}_power_probe_diagnostic"
+        self._attr_name = "My Cloud Power Probe"
+
+    @property
+    def available(self):
+        return True
+
+    @property
+    def native_value(self):
+        return self.coordinator.runtime_diagnostics["api_poll_decision"]
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            **self.coordinator.runtime_diagnostics,
+            **self.coordinator.power_probe_diagnostics,
+            **self.coordinator.api_diagnostics,
+        }
+
+
 class MyCloudCachedEntity(CoordinatorEntity):
     """Expose cache freshness without changing entity identity or value."""
 
@@ -291,6 +324,7 @@ class MyCloudCachedEntity(CoordinatorEntity):
             "last_successful_update": self.coordinator.data.get("last_full_update"),
             **self.coordinator.power_probe_diagnostics,
             **self.coordinator.api_diagnostics,
+            **self.coordinator.runtime_diagnostics,
         }
 
 

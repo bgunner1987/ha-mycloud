@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.11` (manifest version `1.3.11`) or select `main` when testing current development changes.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.12` (manifest version `1.3.12`) or select `main` when testing current development changes.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -91,6 +91,10 @@ AsyncSSH receives an explicit empty known-hosts object, not empty bytes or `None
 ### Diagnosing unavailable Sleeping sensors
 
 If Sleeping sensors stay unavailable, inspect a **CPU or Memory sensor** in **Developer Tools > States**. System sensors remain available from the stored snapshot during SSH failures; their attributes include:
+
+Version 1.3.12 also creates **My Cloud Power Probe**, an always-available diagnostic sensor, even before the first API snapshot. Its identity is scoped to the config entry; existing system/disk entity IDs are unchanged. The integration's **Download diagnostics** command exports the same safe runtime fields without passwords, account names, host addresses, keys, or raw SSH output. See [the v1.3.12 troubleshooting guide](docs/sleep-aware-v1.3.12.md) for installation, option reload verification, the complete command protocol, and a standalone real-SSH diagnostic.
+
+Additional fields include `integration_version`, `configured_power_probe_method`, `effective_power_probe_method`, `checked_devices`, `device_probe_results` (state and individual exit status), `ssh_command_exit_status`, `probe_loop_status`, `probe_loop_running`, `api_poll_decision`, `polling_block_reason`, `api_stage`, `api_interval_remaining_seconds`, and `next_periodic_api_poll_at`. Probe failures distinguish `device_missing` and `program_missing` from transport, command, and format failures.
 
 - `last_power_check`: timestamp of the latest power probe, even on failure.
 - `last_successful_power_check`: timestamp of the latest successfully executed and parsed SSH command, including a result containing `unknown`.

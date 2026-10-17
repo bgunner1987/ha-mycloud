@@ -30,6 +30,7 @@ _STATE_PATTERN = re.compile(
 _DEVICE_HEADER_PATTERN = re.compile(r"^\s*(/dev/(?:sd|hd)[a-z]+):\s*$")
 _SMARTCTL_DEVICE = "__MYCLOUD_DISK__ "
 _SMARTCTL_STATUS = "__MYCLOUD_STATUS__ "
+_SMARTCTL_ERROR = "__MYCLOUD_ERROR__ "
 _SMARTCTL_STATE = re.compile(r"^Device is in (.+) mode(?:, exit\((\d+)\))?$")
 _SMARTCTL_UNKNOWN = re.compile(
     r"^CHECK POWER MODE (?:returned unknown value 0x[0-9a-fA-F]+|not implemented), "
@@ -46,18 +47,40 @@ def build_smartctl_command(drive_devices: Sequence[str]) -> str:
     options are provided. Each result includes its validated path and its own
     exit status; status 3 represents an asleep drive.
     """
-    lines = []
+    # Noninteractive SSH sessions often omit sbin from PATH. Only look for
+    # executable files; this does not open disks or run smartctl discovery.
+    lines = [
+        "mycloud_smartctl=",
+        (
+            "for mycloud_candidate in /usr/sbin/smartctl /usr/bin/smartctl "
+            "/sbin/smartctl /bin/smartctl; do "
+            'if test -x "$mycloud_candidate"; then '
+            'mycloud_smartctl=$mycloud_candidate; break; fi; done'
+        ),
+        (
+            'if test -z "$mycloud_smartctl"; then '
+            'mycloud_smartctl=$(command -v smartctl 2>/dev/null) || mycloud_smartctl=; fi'
+        ),
+    ]
     for device in parse_drive_devices(drive_devices):
         lines.extend((
             f"printf '{_SMARTCTL_DEVICE}{device}\\n'",
-            f"LC_ALL=C smartctl -d sat -n standby,3 {device} 2>&1",
-            f"printf '{_SMARTCTL_STATUS}%s\\n' \"$?\"",
+            (
+                f"if ! test -b {device}; then "
+                f"printf '{_SMARTCTL_ERROR}device_missing\\n'; mycloud_status=2; "
+                'elif test -z "$mycloud_smartctl"; then '
+                f"printf '{_SMARTCTL_ERROR}program_missing\\n'; mycloud_status=127; "
+                f'elif LC_ALL=C "$mycloud_smartctl" -d sat -n standby,3 {device} 2>&1; '
+                'then mycloud_status=0; else mycloud_status=$?; fi'
+            ),
+            f"printf '\\n{_SMARTCTL_STATUS}%s\\n' \"$mycloud_status\"",
         ))
     return "\n".join(lines)
 
 
 def parse_smartctl_states(
-    output: str, drive_devices: Sequence[str]
+    output: str, drive_devices: Sequence[str],
+    *, diagnostics: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     """Require a complete, unambiguous per-disk result; never infer awake."""
     devices = parse_drive_devices(drive_devices)
@@ -72,6 +95,10 @@ def parse_smartctl_states(
                 raise ValueError("Missing smartctl status")
             current = device
             sections[device] = ([], None)
+            if diagnostics is not None:
+                diagnostics[device] = {
+                    "state": POWER_UNKNOWN, "exit_status": None, "error_type": None,
+                }
         elif line.startswith(_SMARTCTL_STATUS):
             if current is None or sections[current][1] is not None:
                 raise ValueError("Unexpected smartctl status")
@@ -79,13 +106,11 @@ def parse_smartctl_states(
             if not status_text.isascii() or not status_text.isdecimal():
                 raise ValueError("Invalid smartctl status")
             status = int(status_text)
-            if status not in (0, 3):
-                raise PowerProbeError(
-                    "smartctl power-state command failed", stage="command",
-                    error_type="command_failed", detail="nonzero_exit",
-                    exit_status=status, probe_type="smartctl_sat_power_state",
-                )
+            if not 0 <= status <= 255:
+                raise ValueError("Invalid smartctl status")
             sections[current] = (sections[current][0], status)
+            if diagnostics is not None:
+                diagnostics[current]["exit_status"] = status
         elif current is not None:
             if sections[current][1] is not None:
                 if line.strip():
@@ -98,8 +123,34 @@ def parse_smartctl_states(
         raise ValueError("Missing smartctl device")
 
     states = {}
+    failure = None
     for device in devices:
         lines, status = sections[device]
+        device_diagnostic = {
+            "state": POWER_UNKNOWN, "exit_status": status, "error_type": None,
+        }
+        if diagnostics is not None:
+            diagnostics[device] = device_diagnostic
+        error_markers = [
+            line.removeprefix(_SMARTCTL_ERROR)
+            for line in lines if line.startswith(_SMARTCTL_ERROR)
+        ]
+        if status not in (None, 0, 3):
+            error_type = "command_failed"
+            if error_markers == ["device_missing"] and status == 2:
+                error_type = "device_missing"
+            elif status == 127:
+                error_type = "program_missing"
+            device_diagnostic["error_type"] = error_type
+            failure = failure or PowerProbeError(
+                "smartctl power-state command failed", stage="command",
+                error_type=error_type,
+                detail=error_type if error_type != "command_failed" else "nonzero_exit",
+                exit_status=status, probe_type="smartctl_sat_power_state",
+            )
+            continue
+        if error_markers:
+            raise ValueError("Inconsistent smartctl error marker")
         matches = [
             match for line in lines if (match := _SMARTCTL_STATE.fullmatch(line))
         ]
@@ -118,6 +169,9 @@ def parse_smartctl_states(
             states[device] = POWER_STANDBY
         else:
             raise ValueError("Unrecognized or inconsistent smartctl power state")
+        device_diagnostic["state"] = states[device]
+    if failure is not None:
+        raise failure
     return states
 
 
@@ -242,6 +296,13 @@ class SSHPowerStateClient:
         self._process: Any | None = None
         self._process_running = False
         self._probe_lock = asyncio.Lock()
+        self.last_command_exit_status: int | None = None
+        self.device_diagnostics: dict[str, dict[str, Any]] = {}
+
+    @property
+    def probe_method(self) -> str:
+        """Return the method actually used by this client instance."""
+        return self._probe_method
 
     @property
     def probe_type(self) -> str:
@@ -310,6 +371,11 @@ class SSHPowerStateClient:
     async def _async_check_once(self) -> dict[str, str]:
         """Read every configured drive through one connection and one exec channel."""
         states: dict[str, str] = {}
+        self.last_command_exit_status = None
+        self.device_diagnostics = {
+            device: {"state": POWER_UNKNOWN, "exit_status": None, "error_type": None}
+            for device in self._drive_devices
+        }
         failure: BaseException | None = None
         try:
             connection = await self._async_connect()
@@ -343,6 +409,11 @@ class SSHPowerStateClient:
                         asyncio.get_running_loop().time() - started
                     ),
                 ) from err
+            self.last_command_exit_status = (
+                result.exit_status
+                if type(result.exit_status) is int and 0 <= result.exit_status <= 255
+                else None
+            )
             if result.exit_status != 0:
                 raise self._probe_error(
                     "SSH power-state command failed", stage="command",
@@ -354,8 +425,16 @@ class SSHPowerStateClient:
                 )
             output = f"{result.stdout or ''}\n{result.stderr or ''}"
             try:
-                parser = parse_smartctl_states if use_smartctl else parse_hdparm_states
-                states = parser(output, self._drive_devices)
+                if use_smartctl:
+                    states = parse_smartctl_states(
+                        output, self._drive_devices, diagnostics=self.device_diagnostics
+                    )
+                else:
+                    states = parse_hdparm_states(output, self._drive_devices)
+                    self.device_diagnostics = {
+                        device: {"state": state, "exit_status": None, "error_type": None}
+                        for device, state in states.items()
+                    }
             except ValueError as err:
                 raise self._probe_error(
                     "Unrecognized power-state response", stage="command",
@@ -403,6 +482,12 @@ class SSHPowerStateClient:
                 failure.__suppress_context__ = True
 
         if failure is not None:
+            safe_failure = (
+                failure.error_type if isinstance(failure, PowerProbeError) else None
+            )
+            for diagnostic in self.device_diagnostics.values():
+                if diagnostic["state"] == POWER_UNKNOWN and not diagnostic["error_type"]:
+                    diagnostic["error_type"] = safe_failure
             raise failure
 
         return states

@@ -13,7 +13,12 @@ from typing import Any
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api_diagnostics import APIFailure, describe_api_error, log_api_failure
-from .const import DEFAULT_POWER_PROBE_INTERVAL
+from .const import (
+    DEFAULT_POWER_PROBE_INTERVAL,
+    INTEGRATION_VERSION,
+    PROBE_METHOD_HDPARM,
+    PROBE_METHOD_SMARTCTL_SAT,
+)
 from .power_probe import (
     POWER_ACTIVE,
     POWER_STANDBY,
@@ -75,6 +80,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         api_client_factory: Callable[[], Any] | None = None,
         probe_retry_delays: tuple[float, ...] = _DEFAULT_PROBE_RETRY_DELAYS,
         sleep_func: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        configured_probe_method: str | None = None,
     ) -> None:
         # Sleep-aware timing is owned by one lightweight background loop. Passing
         # None prevents DataUpdateCoordinator from independently scheduling a
@@ -138,6 +144,57 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cycle_lock = asyncio.Lock()
         self._probe_task: asyncio.Task | None = None
         self._closed = False
+        self._configured_probe_method = configured_probe_method
+        self._probe_loop_status = "not_started" if power_client else "disabled"
+        self._api_stage = "not_started"
+        self._api_poll_decision = "not_checked" if power_client else "legacy"
+
+    @property
+    def runtime_diagnostics(self) -> dict[str, Any]:
+        """Describe each gate without exposing configuration credentials or I/O."""
+        client = self.power_client
+        methods = (PROBE_METHOD_HDPARM, PROBE_METHOD_SMARTCTL_SAT)
+        effective = getattr(client, "probe_method", None)
+        configured = self._configured_probe_method
+        references = [
+            parsed for value in (self._last_full_update, self._last_api_attempt_at)
+            if (parsed := _parse_timestamp(value)) is not None
+        ]
+        next_api = max(references) + self._api_update_interval if references else None
+        observed = _parse_timestamp(self.last_power_check)
+        remaining = (
+            max(0, round((next_api - observed).total_seconds(), 1))
+            if next_api is not None and observed is not None else 0
+        )
+        block_reason = None
+        if self._api_poll_decision == "probe_error":
+            block_reason = self.power_probe_error_type
+        elif self._api_poll_decision == "api_failed":
+            block_reason = self.last_api_error_type
+        elif self._api_poll_decision in {
+            "not_checked", "unknown", "mixed", "standby", "interval_wait"
+        }:
+            block_reason = self._api_poll_decision
+        return {
+            "integration_version": INTEGRATION_VERSION,
+            "configured_power_probe_method": configured if configured in methods else None,
+            "effective_power_probe_method": effective if effective in methods else None,
+            "checked_devices": list(self.drive_devices),
+            "device_probe_results": deepcopy(getattr(client, "device_diagnostics", {})),
+            "ssh_command_exit_status": getattr(client, "last_command_exit_status", None),
+            "probe_loop_status": self._probe_loop_status,
+            "probe_loop_running": self._probe_task is not None and not self._probe_task.done(),
+            "power_probe_interval_seconds": self._power_probe_interval.total_seconds(),
+            "api_update_interval_seconds": self._api_update_interval.total_seconds(),
+            "api_poll_decision": self._api_poll_decision,
+            "polling_block_reason": block_reason,
+            "api_stage": self._api_stage,
+            "wake_poll_pending": self._wake_poll_pending,
+            "next_periodic_api_poll_at": next_api.isoformat() if next_api else None,
+            "api_interval_remaining_seconds": remaining,
+            "has_api_cache": self._cached_data is not None,
+            "last_successful_update": self._last_full_update,
+        }
 
     @property
     def power_probe_diagnostics(self) -> dict[str, Any]:
@@ -291,16 +348,23 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
         self._api_started = True
 
+    def _set_api_stage(self, stage: str) -> None:
+        """Publish fixed internal stage names even while an API call is pending."""
+        self._api_stage = stage
+        self.async_update_listeners()
+
     async def _async_fetch_once(self, api_client) -> dict[str, Any]:
         # Wake-phase polls always refresh the complete snapshot. Legacy mode
         # retains its prior dynamic-only refresh once static data is cached.
         include_static = self.power_client is not None or self._cached_data is None
-        result = {
-            "system_info": await api_client.system_info(),
-            "system_status": await api_client.system_status(),
-        }
+        self._set_api_stage("system_info")
+        result = {"system_info": await api_client.system_info()}
+        self._set_api_stage("system_status")
+        result["system_status"] = await api_client.system_status()
         if include_static:
+            self._set_api_stage("device_info")
             result["device_info"] = await api_client.device_info()
+            self._set_api_stage("system_version")
             result["system_version"] = await api_client.system_version()
         else:
             result["device_info"] = deepcopy(self._cached_data["device_info"])
@@ -316,6 +380,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # The power gate is already satisfied. Re-authenticate once on this same
         # opened session, then repeat the complete snapshot exactly once.
+        self._set_api_stage("reauthentication")
         await api_client.login()
         return await self._async_fetch_once(api_client)
 
@@ -367,6 +432,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         result.update(self.power_probe_diagnostics)
         result.update(self.api_diagnostics)
+        result.update(self.runtime_diagnostics)
         return result
 
     def _diagnostic_signature(self) -> tuple[Any, ...]:
@@ -516,6 +582,8 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_full_poll(self, attempt_time: str) -> dict[str, Any]:
         self._last_api_attempt_at = attempt_time
+        self.last_api_attempt_status = "in_progress"
+        self._set_api_stage("opening_client")
         try:
             if self.power_client is not None:
                 fresh_data = await self._async_fetch_short_lived()
@@ -528,6 +596,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.last_api_attempt_status = "error"
             self.last_api_error_type = failure.error_type
             self.last_api_error = failure.summary
+            self._api_poll_decision = "api_failed"
             if failure != self._last_logged_api_failure:
                 log_api_failure(self._integration_logger, failure)
                 self._last_logged_api_failure = failure
@@ -540,6 +609,8 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_logged_api_failure = None
         self._cached_data = fresh_data
         self._last_full_update = _utc_now()
+        self._api_stage = "complete"
+        self._api_poll_decision = "snapshot_updated"
         await self._async_save_cache()
         return self._cached_result(False)
 
@@ -553,6 +624,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._wake_poll_pending = True
 
         if not all_active:
+            self._api_poll_decision = self.api_block_reason or "unknown"
             if self._cached_data is None:
                 raise UpdateFailed(FIRST_SETUP_MESSAGE)
             return self._cached_result(True), changed
@@ -564,10 +636,12 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and (self._last_api_attempt_at is None or not self._last_api_attempt_failed)
         )
         if immediate_wake_poll or interval_due:
+            self._api_poll_decision = "wake_phase" if immediate_wake_poll else "interval_due"
             # Consume before access. Failures cannot create a rapid retry loop.
             self._wake_poll_pending = False
             return await self._async_full_poll(now), True
 
+        self._api_poll_decision = "interval_wait"
         if self._cached_data is None:
             raise UpdateFailed(
                 "The WD API poll failed and no cached data is available. Waiting for "
@@ -587,9 +661,12 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_power_probe_loop(self) -> None:
         while True:
             try:
+                self._probe_loop_status = "checking"
+                self.async_update_listeners()
                 async with self._cycle_lock:
                     data, relevant = await self._async_sleep_aware_cycle()
             except asyncio.CancelledError:
+                self._probe_loop_status = "stopped"
                 raise
             except UpdateFailed as err:
                 if self._cached_data is None:
@@ -602,6 +679,10 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 if relevant:
                     self.async_set_updated_data(data)
+            self._probe_loop_status = "waiting"
+            # Refresh diagnostics even without a first API snapshot or a change
+            # in the NAS values. This performs no network I/O.
+            self.async_update_listeners()
             await self._sleep(self._power_probe_interval.total_seconds())
 
     async def async_shutdown(self) -> None:
@@ -609,6 +690,7 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._closed:
             return
         self._closed = True
+        self._probe_loop_status = "stopped"
         task, self._probe_task = self._probe_task, None
         if task is not None:
             task.cancel()

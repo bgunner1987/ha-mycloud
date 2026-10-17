@@ -13,11 +13,13 @@ import asyncssh
 _ERROR_TYPES = {
     "authentication_failed", "host_key_mismatch", "algorithm_negotiation_failed",
     "connection_failed", "command_failed", "timeout", "parse_failed",
+    "device_missing", "program_missing",
 }
 _DETAILS = {
     "probe_failed", "connect_failed", "command_failed", "nonzero_exit",
     "command_timeout", "unrecognized_hdparm_output", "cleanup_timeout",
     "process_cleanup_timeout", "cleanup_failed", "unrecognized_smartctl_output",
+    "device_missing", "program_missing",
 }
 _PROBE_TYPES = {"hdparm_power_state", "smartctl_sat_power_state"}
 

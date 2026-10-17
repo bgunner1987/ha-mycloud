@@ -9,6 +9,7 @@ from .const import (
     CONF_POWER_PROBE_INTERVAL,
     DEFAULT_POWER_PROBE_INTERVAL,
     DOMAIN,
+    INTEGRATION_VERSION,
     LEGACY_DEFAULT_POWER_PROBE_INTERVAL,
 )
 
@@ -32,7 +33,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up one My Cloud config entry."""
-    _LOGGER.info("Setting up My Cloud integration")
+    _LOGGER.info("Setting up My Cloud integration version %s", INTEGRATION_VERSION)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {}
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

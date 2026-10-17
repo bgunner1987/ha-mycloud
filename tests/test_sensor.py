@@ -19,6 +19,7 @@ def make_coordinator(power_state):
     return SimpleNamespace(
         last_update_success=True,
         power_probe_diagnostics={},
+        runtime_diagnostics={},
         api_diagnostics={
             "last_api_attempt": "2026-09-03T08:00:00+00:00",
             "last_api_attempt_status": "success",
