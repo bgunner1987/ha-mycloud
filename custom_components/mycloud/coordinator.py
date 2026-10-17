@@ -121,7 +121,8 @@ class MyCloudDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.power_probe_error_stage: str | None = None
         self.power_probe_error_duration_seconds: float | None = None
         self.power_probe_type: str | None = (
-            "hdparm_power_state" if power_client else None
+            getattr(power_client, "probe_type", "hdparm_power_state")
+            if power_client else None
         )
         self.last_power_probe_error: str | None = None
         self.consecutive_probe_failures = 0

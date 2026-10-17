@@ -20,13 +20,16 @@ from custom_components.mycloud.config_flow import (
 from custom_components.mycloud.const import (
     CONF_DRIVE_DEVICES,
     CONF_POWER_PROBE_INTERVAL,
+    CONF_POWER_PROBE_METHOD,
     CONF_SLEEP_AWARE_ENABLED,
     CONF_SSH_PASSWORD,
     CONF_SSH_PORT,
     CONF_SSH_USERNAME,
     CONF_UPDATE_INTERVAL,
+    DEFAULT_POWER_PROBE_METHOD,
     HOST,
     PASSWORD,
+    PROBE_METHOD_SMARTCTL_SAT,
     USERNAME,
     VERSION,
 )
@@ -59,6 +62,7 @@ async def test_initial_flow_stores_sleep_aware_settings_as_options():
     assert result["options"][CONF_SLEEP_AWARE_ENABLED] is True
     assert result["options"][CONF_DRIVE_DEVICES] == "/dev/sda,/dev/sdc"
     assert result["options"][CONF_POWER_PROBE_INTERVAL] == 10
+    assert result["options"][CONF_POWER_PROBE_METHOD] == DEFAULT_POWER_PROBE_METHOD
 
 
 def make_flow(kind):
@@ -106,6 +110,24 @@ async def test_form_serializes_with_real_voluptuous_serialize(kind):
     assert drive_field["type"] == "string"
     probe_field = next(item for item in serialized if item["name"] == CONF_POWER_PROBE_INTERVAL)
     assert probe_field["default"] == 10
+    method_field = next(
+        item for item in serialized if item["name"] == CONF_POWER_PROBE_METHOD
+    )
+    assert method_field["default"] == DEFAULT_POWER_PROBE_METHOD
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["config", "options"])
+async def test_smartctl_probe_method_serializes_and_is_saved(kind):
+    _, step = make_flow(kind)
+    form = await step()
+    data = submitted_data(kind, "/dev/sda,/dev/sdb")
+    data[CONF_POWER_PROBE_METHOD] = PROBE_METHOD_SMARTCTL_SAT
+
+    result = await step(form["data_schema"](data))
+
+    saved = result["options"] if kind == "config" else result["data"]
+    assert saved[CONF_POWER_PROBE_METHOD] == PROBE_METHOD_SMARTCTL_SAT
 
 
 @pytest.mark.asyncio

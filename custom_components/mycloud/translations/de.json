@@ -14,14 +14,16 @@
                     "ssh_port": "SSH-Port",
                     "ssh_username": "SSH-Benutzername",
                     "ssh_password": "SSH-Passwort",
-                    "drive_devices": "Festplattengeräte"
+                    "drive_devices": "Festplattengeräte",
+                    "power_probe_method": "Prüfmethode des Plattenzustands"
                 },
                 "data_description": {
                     "update_interval": "Bisheriges Abfrageintervall und Mindestabstand regelmäßiger vollständiger API-Snapshots im schlafbewussten Modus. Steuert nicht die Prüfung des Plattenzustands.",
-                    "power_probe_interval": "Nicht weckende SSH-/hdparm-Prüfung im schlafbewussten Modus. Standard und Minimum 10 Sekunden.",
-                    "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Deaktiviert bleibt das bisherige Verhalten erhalten. Unbekannte Zustände sperren die WD-API, behalten aber je Platte den zuletzt bestätigten Sleeping-Zustand bei.",
+                    "power_probe_interval": "Nicht weckende SSH-Prüfung mit der gewählten Methode. Standard und Minimum 10 Sekunden.",
+                    "sleep_aware_enabled": "Benötigt SSH und das gewählte Prüfprogramm auf dem NAS. Unbekannte Zustände sperren die WD-API; bestätigte Sleeping-Zustände bleiben sichtbar.",
                     "ssh_password": "Wird von Home Assistant gespeichert. Möglichst eigene Zugangsdaten verwenden und den Zugriff auf Home-Assistant-Sicherungen beschränken.",
-                    "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc."
+                    "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc.",
+                    "power_probe_method": "hdparm bleibt der bisherige Standard. smartctl (SAT) erkennt zusätzlich IDLE_A/B/C; benötigt smartctl 7.2 oder neuer. Es wird nur CHECK POWER MODE abgefragt, ohne SMART-Daten oder Gerätetyperkennung."
                 }
             }
         },
@@ -39,7 +41,7 @@
         "step": {
             "init": {
                 "title": "Abfrageoptionen",
-                "description": "Die schlafbewusste Abfrage prüft alle konfigurierten Platten mit hdparm und fragt die API nur bei einer sicher erkannten Wachphase oder bei fälligem API-Intervall vollständig ab. Die Leistungszustandsprüfung erfolgt standardmäßig alle 10 Sekunden. Das minimale API-Intervall beträgt {minimum_interval} Sekunden.",
+                "description": "Die schlafbewusste Abfrage prüft alle konfigurierten Platten per SSH mit der gewählten Prüfmethode und fragt die API nur bei einer sicher erkannten Wachphase oder bei fälligem API-Intervall vollständig ab. Die Leistungszustandsprüfung erfolgt standardmäßig alle 10 Sekunden. Das minimale API-Intervall beträgt {minimum_interval} Sekunden.",
                 "data": {
                     "update_interval": "API-Aktualisierungsintervall (Sekunden)",
                     "power_probe_interval": "Prüfintervall des Plattenzustands (Sekunden)",
@@ -47,14 +49,16 @@
                     "ssh_port": "SSH-Port",
                     "ssh_username": "SSH-Benutzername",
                     "ssh_password": "SSH-Passwort",
-                    "drive_devices": "Festplattengeräte"
+                    "drive_devices": "Festplattengeräte",
+                    "power_probe_method": "Prüfmethode des Plattenzustands"
                 },
                 "data_description": {
                     "update_interval": "Bisheriges Abfrageintervall und Mindestabstand regelmäßiger vollständiger API-Snapshots im schlafbewussten Modus. Steuert nicht die Prüfung des Plattenzustands.",
-                    "power_probe_interval": "Nicht weckende SSH-/hdparm-Prüfung im schlafbewussten Modus. Standard und Minimum 10 Sekunden.",
-                    "sleep_aware_enabled": "Benötigt SSH und /usr/bin/hdparm auf dem NAS. Unbekannte Zustände sperren die WD-API, behalten aber je Platte den zuletzt bestätigten Sleeping-Zustand bei.",
+                    "power_probe_interval": "Nicht weckende SSH-Prüfung mit der gewählten Methode. Standard und Minimum 10 Sekunden.",
+                    "sleep_aware_enabled": "Benötigt SSH und das gewählte Prüfprogramm auf dem NAS. Unbekannte Zustände sperren die WD-API; bestätigte Sleeping-Zustände bleiben sichtbar.",
                     "ssh_password": "Wird von Home Assistant gespeichert. Möglichst eigene Zugangsdaten verwenden und den Zugriff auf Home-Assistant-Sicherungen beschränken.",
-                    "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc."
+                    "drive_devices": "Kommagetrennte Pfade ganzer Festplatten, zum Beispiel /dev/sda,/dev/sdc.",
+                    "power_probe_method": "hdparm bleibt der bisherige Standard. smartctl (SAT) erkennt zusätzlich IDLE_A/B/C; benötigt smartctl 7.2 oder neuer. Es wird nur CHECK POWER MODE abgefragt, ohne SMART-Daten oder Gerätetyperkennung."
                 }
             }
         }

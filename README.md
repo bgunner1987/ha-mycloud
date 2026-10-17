@@ -20,7 +20,7 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 ## Installation
 
 ### HACS (Recommended)
-1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.8` (manifest version `1.3.8`) or select `main` when testing current development changes.
+1. Add [bgunner1987/ha-mycloud](https://github.com/bgunner1987/ha-mycloud) as a custom integration repository in HACS. Install release `v1.3.11` (manifest version `1.3.11`) or select `main` when testing current development changes.
 2. Search for "WD My Cloud" and install the integration.
 3. Restart Home Assistant.
 
@@ -46,13 +46,14 @@ This integration is powered by the [wdnas-client](https://github.com/J-shw/wdnas
 Sleep-aware polling is disabled by default, so existing installations continue to use the WD API normally. It can be enabled during a new integration setup or later in the integration's **Configure** dialog. Set:
 
 - **Enable sleep-aware polling**: enabled
+- **Disk power probe method**: `hdparm` (compatible default) or `smartctl (SAT)`
 - **Disk power probe interval**: `10` seconds by default and minimum
 - **SSH port**: `22` (default)
 - **SSH username**: use the external login name which actually works in PuTTY
 - **SSH password**: the corresponding SSH password
 - **Drive devices**: comma-separated whole-disk paths, for example `/dev/sda,/dev/sdc`
 
-The feature requires SSH to be enabled on the NAS, `/usr/bin/hdparm` to be present, and the SSH user to have permission to run `/usr/bin/hdparm -C` for every configured drive. Device paths are restricted to whole SATA/SCSI disk names such as `/dev/sda`; shell fragments and partition paths are rejected.
+The feature requires SSH to be enabled on the NAS and the SSH user to have permission to run the selected fixed probe. The compatible default uses `/usr/bin/hdparm -C`. The optional `smartctl (SAT)` method uses `smartctl -d sat -n standby,3` and recognizes `IDLE_A`, `IDLE_B`, and `IDLE_C` as awake states on devices where hdparm reports `unknown`. It requests CHECK POWER MODE only—no SMART attributes, device identification, or self-test—and requires smartctl 7.2 or newer. Device paths are restricted to whole SATA/SCSI disk names such as `/dev/sda`; shell fragments and partition paths are rejected.
 
 Both setup and options forms show drive devices as a serializable text field. On submission, paths are trimmed, validated, and stored in canonical comma-separated form. Invalid input displays an error at the drive-devices field; no settings are saved. Validation applies even when sleep-aware polling is disabled, and the SSH client independently validates device paths before constructing any commands.
 
@@ -60,7 +61,7 @@ On the WD My Cloud EX2 Ultra, the external SSH login name can be `sshd` even tho
 
 The EX2 Ultra can impose a very small session limit on this special `sshd` account. The short-lived SSH lifecycle prevents Home Assistant from permanently occupying a slot, so later PuTTY and WD web-interface logins are not blocked by an idle integration connection. A probe can still fail closed while all available SSH slots are temporarily occupied.
 
-In sleep-aware mode, one internal lightweight loop runs on the separate `power_probe_interval` (default and minimum 10 seconds). Existing entries which stored the former 60-second default are migrated once to 10 seconds; other explicitly configured values are preserved. The `update_interval` (default 600 seconds) remains the legacy polling interval and becomes the minimum spacing for periodic full API snapshots in sleep-aware mode. Each power check opens one short-lived SSH connection and one exec channel, running exactly one command such as `/usr/bin/hdparm -C /dev/sda /dev/sdc`. Output is matched by its exact validated device header rather than by position. Missing, duplicate, unexpected, or ambiguous sections fail the complete probe closed. Connection, command, and cleanup waits are bounded, and no immediate connection retry is made. The connection is closed before returning—even for `unknown`, errors, or cancellation—and no connection remains open during the roughly 2- and 5-second follow-up waits. A lock prevents overlapping checks.
+In sleep-aware mode, one internal lightweight loop runs on the separate `power_probe_interval` (default and minimum 10 seconds). Existing entries which stored the former 60-second default are migrated once to 10 seconds; other explicitly configured values are preserved. The `update_interval` (default 600 seconds) remains the legacy polling interval and becomes the minimum spacing for periodic full API snapshots in sleep-aware mode. Each power check opens one short-lived SSH connection and one exec channel. The hdparm method runs `/usr/bin/hdparm -C` for all validated devices; the smartctl method runs one framed SAT power check per validated device within that same channel and records each exit status separately. Output is matched by its exact validated device header rather than by position. Missing, duplicate, unexpected, or ambiguous sections fail the complete probe closed. Connection, command, and cleanup waits are bounded, and no immediate connection retry is made. The connection is closed before returning—even for `unknown`, errors, or cancellation—and no connection remains open during the roughly 2- and 5-second follow-up waits. A lock prevents overlapping checks.
 
 When no drive reports `standby` but at least one reports `unknown`, bounded follow-ups occur about 2 and 5 seconds after the initial check. They stop immediately on any `standby` result or once every drive is safely `active/idle`. The WD API is contacted only when **every** configured drive reports `active/idle`:
 
@@ -71,7 +72,7 @@ When no drive reports `standby` but at least one reports `unknown`, bounded foll
 - `unknown`, a malformed response, timeout, SSH failure, or host-key mismatch always blocks API access but does **not** rearm the current wake phase. If a sleep phase produced only `unknown`, a later all-active check may refresh once the API interval is due.
 - The wake-phase state is not persisted. After a Home Assistant restart, already-awake disks may be queried once again.
 
-This avoids repeatedly resetting the NAS standby timer: continuous all-active operation can refresh only at the configured API interval, while a definitely observed standby-to-active wake phase may refresh immediately. An API failure consumes the attempt and the same interval gate prevents a rapid retry loop, including after another quick standby transition. A safe all-active poll handles one HTTP 403 by calling `login()` once and repeating the complete snapshot once on the same opened client; a second 403 stops immediately. Subsequent blocked checks retain cached values (or report no available cache). The integration never calls `smartctl` and does not use `/tmp/standby`.
+This avoids repeatedly resetting the NAS standby timer: continuous all-active operation can refresh only at the configured API interval, while a definitely observed standby-to-active wake phase may refresh immediately. An API failure consumes the attempt and the same interval gate prevents a rapid retry loop, including after another quick standby transition. A safe all-active poll handles one HTTP 403 by calling `login()` once and repeating the complete snapshot once on the same opened client; a second 403 stops immediately. Subsequent blocked checks retain cached values (or report no available cache). When selected, smartctl is used only for CHECK POWER MODE; the integration does not use `/tmp/standby`.
 
 The shorter probe interval and bounded follow-ups catch transitions the old 60/600-second cadence missed. A complete standby/wake cycle between two checks can still be missed; the interval fallback ensures a later confirmed all-active state can eventually refresh even if only `unknown` was observed.
 
@@ -95,19 +96,22 @@ If Sleeping sensors stay unavailable, inspect a **CPU or Memory sensor** in **De
 - `last_successful_power_check`: timestamp of the latest successfully executed and parsed SSH command, including a result containing `unknown`.
 - `last_conclusive_power_check`: timestamp of the latest probe in which every configured disk returned `active/idle` or `standby`.
 - `consecutive_probe_failures`: consecutive SSH probe exceptions since the last parsed result.
-- `raw_power_states`: current per-drive SSH/hdparm result used by the API safety gate.
+- `consecutive_command_timeouts`: consecutive command-stage timeouts, reset by any successful probe.
+- `raw_power_states`: current per-drive SSH probe result used by the API safety gate.
 - `power_states`: backward-compatible alias of `raw_power_states`.
 - `last_confirmed_power_states`: latest runtime-only conclusive state retained independently for each disk and used only by Sleeping entities.
 - `power_state_stale`: true when the current raw probe is missing, failed, or contains `unknown`.
-- `power_probe_status`: `pending`, `disabled`, `ok` (a readable probe, including standby/mixed), `unknown` (hdparm explicitly reports unknown), or `error`.
+- `power_probe_status`: `pending`, `disabled`, `ok` (a readable probe, including standby/mixed), `unknown` (the selected probe explicitly reports unknown), or `error`.
+- `power_probe_type`: `hdparm_power_state` or `smartctl_sat_power_state`.
 - `power_probe_error_type`: current failure category, or null after a successful probe.
+- `power_probe_error_stage` and `power_probe_error_duration_seconds`: safe operation stage and bounded runtime diagnostics.
 - `last_power_probe_error`: safe description of the current error, cleared on recovery.
 - `api_poll_allowed`: true only when every configured disk is explicitly `active/idle` in the same current raw probe.
 - `api_block_reason`: `not_checked`, `probe_error`, `unknown`, `standby`, or `mixed`; null when the raw probe allows API access.
 
-Failure categories are `authentication_failed`, `host_key_mismatch`, `algorithm_negotiation_failed`, `connection_failed`, `command_failed`, `timeout`, and `parse_failed`. Nonzero command exits and malformed hdparm responses now produce explicit diagnostics; a valid hdparm response of `unknown` is not a parser error. Partial results on a failed probe are discarded and every configured drive is reported unknown.
+Failure categories are `authentication_failed`, `host_key_mismatch`, `algorithm_negotiation_failed`, `connection_failed`, `command_failed`, `timeout`, and `parse_failed`. Nonzero command exits and malformed hdparm/smartctl responses produce explicit diagnostics; a valid explicit `unknown` response is not a parser error. Partial results on a failed probe are discarded and every configured drive is reported unknown.
 
-The first failure and each changed safe cause emit one concise warning containing only the allowlisted failure category and stage, without an exception traceback. Identical consecutive failures are suppressed; recovery is logged once, and a later failure begins a new phase. Authentication and host-key failures remain distinguishable. Raw exception messages, server output/algorithm lists, usernames, passwords, host-key contents, fingerprints, and original traceback frames/locals are **not** sent to logging handlers. Changing only sensitive free text does not cause another log entry.
+The first two consecutive command-stage timeouts are logged at debug level; the third is promoted to one warning and identical later repetitions are suppressed. Other failures and each changed safe cause emit one concise warning containing only allowlisted diagnostics, without an exception traceback. Recovery is logged once, and a later failure begins a new phase. Authentication and host-key failures remain distinguishable. Raw exception messages, server output/algorithm lists, usernames, passwords, host-key contents, fingerprints, and original traceback frames/locals are **not** sent to logging handlers. Changing only sensitive free text does not cause another log entry.
 
 These diagnostics are runtime-only and are not saved in the persistent NAS cache. They are also recorded and logged if no cache exists, although first setup still fails closed without creating sensors. No legacy SSH algorithms are enabled. An SSH/probe failure always blocks WD API access; unlike an observed standby state, a transient error or `unknown` does not immediately rearm the current wake phase.
 

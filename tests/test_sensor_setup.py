@@ -12,11 +12,13 @@ from custom_components.mycloud import sensor as platform
 from custom_components.mycloud.const import (
     CONF_DRIVE_DEVICES,
     CONF_POWER_PROBE_INTERVAL,
+    CONF_POWER_PROBE_METHOD,
     CONF_SLEEP_AWARE_ENABLED,
     CONF_UPDATE_INTERVAL,
     DOMAIN,
     HOST,
     PASSWORD,
+    PROBE_METHOD_SMARTCTL_SAT,
     USERNAME,
     VERSION,
 )
@@ -132,6 +134,26 @@ async def test_sleep_aware_setup_does_not_wait_for_hanging_probe(monkeypatch):
         assert not coordinator.power_probe_task.done()
         for key in make_snapshot([]):
             getattr(api, key).assert_not_awaited()
+    finally:
+        await coordinator.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_platform_passes_selected_smartctl_method_to_power_client(monkeypatch):
+    entities, coordinator, _ = await setup_platform(
+        monkeypatch,
+        make_snapshot(["sda", "sdb"]),
+        {
+            CONF_SLEEP_AWARE_ENABLED: True,
+            CONF_DRIVE_DEVICES: "/dev/sda,/dev/sdb",
+            CONF_POWER_PROBE_METHOD: PROBE_METHOD_SMARTCTL_SAT,
+            CONF_UPDATE_INTERVAL: 600,
+        },
+    )
+    try:
+        assert entities
+        assert coordinator.power_client.probe_type == "smartctl_sat_power_state"
+        assert coordinator.power_probe_type == "smartctl_sat_power_state"
     finally:
         await coordinator.async_shutdown()
 

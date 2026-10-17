@@ -10,15 +10,18 @@ import asyncssh
 import asyncssh.connection as ssh_connection
 import pytest
 
+from custom_components.mycloud.const import PROBE_METHOD_SMARTCTL_SAT
 from custom_components.mycloud.power_probe import (
     POWER_ACTIVE,
     POWER_STANDBY,
     POWER_UNKNOWN,
     PowerProbeError,
     SSHPowerStateClient,
+    build_smartctl_command,
     parse_drive_devices,
     parse_hdparm_state,
     parse_hdparm_states,
+    parse_smartctl_states,
 )
 from custom_components.mycloud.probe_diagnostics import describe_probe_error
 
@@ -91,6 +94,124 @@ def test_parse_multi_device_hdparm_output_by_exact_header(states, expected):
 def test_parse_multi_device_hdparm_rejects_incomplete_or_ambiguous_output(output):
     with pytest.raises(ValueError):
         parse_hdparm_states(output, ("/dev/sda", "/dev/sdc"))
+
+
+def smartctl_output(results):
+    """Return framed output emitted by the fixed smartctl shell wrapper."""
+    lines = []
+    for device, (state_line, status) in results.items():
+        lines.extend((
+            f"__MYCLOUD_DISK__ {device}",
+            "smartctl 7.2 synthetic test banner",
+            state_line,
+            f"__MYCLOUD_STATUS__ {status}",
+        ))
+    return "\n".join(lines)
+
+
+def test_build_smartctl_command_uses_only_validated_paths():
+    command = build_smartctl_command(("/dev/sda", "/dev/sdb"))
+
+    assert command == (
+        "printf '__MYCLOUD_DISK__ /dev/sda\\n'\n"
+        "LC_ALL=C smartctl -d sat -n standby,3 /dev/sda 2>&1\n"
+        "printf '__MYCLOUD_STATUS__ %s\\n' \"$?\"\n"
+        "printf '__MYCLOUD_DISK__ /dev/sdb\\n'\n"
+        "LC_ALL=C smartctl -d sat -n standby,3 /dev/sdb 2>&1\n"
+        "printf '__MYCLOUD_STATUS__ %s\\n' \"$?\""
+    )
+    assert " -a " not in command
+    assert " --scan" not in command
+    with pytest.raises(ValueError):
+        build_smartctl_command(("/dev/sda; reboot",))
+
+
+@pytest.mark.parametrize(
+    "smart_state",
+    ["ACTIVE or IDLE", "IDLE", "IDLE_A", "IDLE_B", "IDLE_C"],
+)
+def test_parse_smartctl_awake_states(smart_state):
+    output = smartctl_output({
+        "/dev/sda": (f"Device is in {smart_state} mode", 0),
+    })
+    assert parse_smartctl_states(output, ("/dev/sda",)) == {
+        "/dev/sda": POWER_ACTIVE,
+    }
+
+
+@pytest.mark.parametrize(
+    "smart_state",
+    ["STANDBY", "STANDBY_Y", "STANDBY_Z", "SLEEP"],
+)
+def test_parse_smartctl_sleeping_states(smart_state):
+    output = smartctl_output({
+        "/dev/sda": (f"Device is in {smart_state} mode, exit(3)", 3),
+    })
+    assert parse_smartctl_states(output, ("/dev/sda",)) == {
+        "/dev/sda": POWER_STANDBY,
+    }
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CHECK POWER MODE returned unknown value 0x81, ignoring -n option",
+        "CHECK POWER MODE not implemented, ignoring -n option",
+    ],
+)
+def test_parse_smartctl_explicit_unknown_is_fail_closed(message):
+    output = smartctl_output({"/dev/sda": (message, 0)})
+    assert parse_smartctl_states(output, ("/dev/sda",)) == {
+        "/dev/sda": POWER_UNKNOWN,
+    }
+
+
+def test_parse_smartctl_matches_devices_by_exact_framed_path():
+    output = smartctl_output({
+        "/dev/sdb": ("Device is in STANDBY mode, exit(3)", 3),
+        "/dev/sda": ("Device is in IDLE_A mode", 0),
+    })
+    assert parse_smartctl_states(output, ("/dev/sda", "/dev/sdb")) == {
+        "/dev/sda": POWER_ACTIVE,
+        "/dev/sdb": POWER_STANDBY,
+    }
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Device is in IDLE_A mode\n__MYCLOUD_STATUS__ 0",
+        "__MYCLOUD_DISK__ /dev/sda\nDevice is in IDLE_A mode",
+        (
+            "__MYCLOUD_DISK__ /dev/sda\nDevice is in IDLE_A mode\n"
+            "Device is in STANDBY mode, exit(3)\n__MYCLOUD_STATUS__ 0"
+        ),
+        smartctl_output({
+            "/dev/sda": ("Device is in IDLE_A mode, exit(3)", 3),
+        }),
+        smartctl_output({
+            "/dev/sda": ("Device is in STANDBY mode, exit(3)", 0),
+        }),
+        smartctl_output({
+            "/dev/sda": ("Device is in VENDOR_PRIVATE mode", 0),
+        }),
+    ],
+)
+def test_parse_smartctl_rejects_incomplete_ambiguous_or_inconsistent_output(output):
+    with pytest.raises(ValueError):
+        parse_smartctl_states(output, ("/dev/sda",))
+
+
+def test_parse_smartctl_non_power_exit_is_a_safe_command_failure():
+    output = smartctl_output({
+        "/dev/sda": ("smartctl: permission denied", 2),
+    })
+    with pytest.raises(PowerProbeError) as error:
+        parse_smartctl_states(output, ("/dev/sda",))
+    failure = describe_probe_error(error.value)
+    assert failure.error_type == "command_failed"
+    assert failure.probe_type == "smartctl_sat_power_state"
+    assert "exit_status=2" in failure.summary
 
 
 class FakeProcess:
@@ -174,6 +295,64 @@ async def test_probe_runs_only_fixed_hdparm_commands(monkeypatch):
     assert not connection.processes[0].terminated
     assert client._connection is None
     assert client._process is None
+
+
+@pytest.mark.asyncio
+async def test_probe_runs_fixed_smartctl_wrapper_and_reports_probe_type(monkeypatch):
+    connection = FakeConnection([smartctl_output({
+        "/dev/sda": ("Device is in IDLE_A mode", 0),
+        "/dev/sdb": ("Device is in STANDBY mode, exit(3)", 3),
+    })])
+    client = SSHPowerStateClient(
+        "nas",
+        22,
+        "root",
+        "not-a-credential",
+        ("/dev/sda", "/dev/sdb"),
+        probe_method=PROBE_METHOD_SMARTCTL_SAT,
+    )
+    use_connections(monkeypatch, connection)
+
+    states = await client.async_check()
+
+    assert states == {"/dev/sda": POWER_ACTIVE, "/dev/sdb": POWER_STANDBY}
+    assert connection.commands == [
+        build_smartctl_command(("/dev/sda", "/dev/sdb"))
+    ]
+    assert client.probe_type == "smartctl_sat_power_state"
+    assert connection.closed
+    assert client._connection is None
+    assert client._process is None
+
+
+@pytest.mark.asyncio
+async def test_smartctl_parser_failure_keeps_allowlisted_probe_diagnostics(monkeypatch):
+    connection = FakeConnection(["synthetic malformed output"])
+    client = SSHPowerStateClient(
+        "nas",
+        22,
+        "root",
+        "not-a-credential",
+        ("/dev/sda",),
+        probe_method=PROBE_METHOD_SMARTCTL_SAT,
+    )
+    use_connections(monkeypatch, connection)
+
+    with pytest.raises(PowerProbeError) as error:
+        await client.async_check()
+
+    failure = describe_probe_error(error.value)
+    assert failure.error_type == "parse_failed"
+    assert failure.probe_type == "smartctl_sat_power_state"
+    assert "unrecognized_smartctl_output" in failure.summary
+
+
+def test_probe_rejects_unknown_method_before_any_ssh_use():
+    with pytest.raises(ValueError, match="Unsupported power probe method"):
+        SSHPowerStateClient(
+            "nas", 22, "root", "not-a-credential", ("/dev/sda",),
+            probe_method="untrusted-method",
+        )
 
 
 class LocalSSHServer(asyncssh.SSHServer):

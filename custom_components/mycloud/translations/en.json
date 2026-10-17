@@ -14,14 +14,16 @@
                     "ssh_port": "SSH port",
                     "ssh_username": "SSH username",
                     "ssh_password": "SSH password",
-                    "drive_devices": "Drive devices"
+                    "drive_devices": "Drive devices",
+                    "power_probe_method": "Disk power probe method"
                 },
                 "data_description": {
                     "update_interval": "Legacy polling interval, and the minimum spacing for periodic full API snapshots in sleep-aware mode. Does not control disk power checks.",
-                    "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default and minimum 10 seconds.",
-                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Leave disabled for legacy behavior. Unknown states block WD API polling but retain each disk's last confirmed Sleeping state.",
+                    "power_probe_interval": "Non-waking SSH probe using the selected method. Default and minimum 10 seconds.",
+                    "sleep_aware_enabled": "Requires SSH and the selected probe tool on the NAS. Unknown states block the WD API; confirmed Sleeping states remain visible.",
                     "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
-                    "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."
+                    "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc.",
+                    "power_probe_method": "hdparm preserves the existing default. smartctl (SAT) also recognizes IDLE_A/B/C and requires smartctl 7.2 or newer. Queries CHECK POWER MODE only, without SMART data or device-type autodetection."
                 }
             }
         },
@@ -39,7 +41,7 @@
         "step": {
             "init": {
                 "title": "Polling options",
-                "description": "Sleep-aware polling checks every configured drive with hdparm and performs full API polls only for a confirmed wake phase or when the API interval is due. Power checks default to 10 seconds. The minimum API interval is {minimum_interval} seconds.",
+                "description": "Sleep-aware polling checks every configured drive with the selected SSH probe method and performs full API polls only for a confirmed wake phase or when the API interval is due. Power checks default to 10 seconds. The minimum API interval is {minimum_interval} seconds.",
                 "data": {
                     "update_interval": "API update interval (seconds)",
                     "power_probe_interval": "Disk power probe interval (seconds)",
@@ -47,14 +49,16 @@
                     "ssh_port": "SSH port",
                     "ssh_username": "SSH username",
                     "ssh_password": "SSH password",
-                    "drive_devices": "Drive devices"
+                    "drive_devices": "Drive devices",
+                    "power_probe_method": "Disk power probe method"
                 },
                 "data_description": {
                     "update_interval": "Legacy polling interval, and the minimum spacing for periodic full API snapshots in sleep-aware mode. Does not control disk power checks.",
-                    "power_probe_interval": "Non-waking SSH/hdparm checks in sleep-aware mode. Default and minimum 10 seconds.",
-                    "sleep_aware_enabled": "Requires SSH and /usr/bin/hdparm on the NAS. Unknown states block WD API polling but retain each disk's last confirmed Sleeping state.",
+                    "power_probe_interval": "Non-waking SSH probe using the selected method. Default and minimum 10 seconds.",
+                    "sleep_aware_enabled": "Requires SSH and the selected probe tool on the NAS. Unknown states block the WD API; confirmed Sleeping states remain visible.",
                     "ssh_password": "Stored by Home Assistant. Use a dedicated credential where possible and restrict access to Home Assistant backups.",
-                    "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc."
+                    "drive_devices": "Comma-separated whole-disk paths, for example /dev/sda,/dev/sdc.",
+                    "power_probe_method": "hdparm preserves the existing default. smartctl (SAT) also recognizes IDLE_A/B/C and requires smartctl 7.2 or newer. Queries CHECK POWER MODE only, without SMART data or device-type autodetection."
                 }
             }
         }

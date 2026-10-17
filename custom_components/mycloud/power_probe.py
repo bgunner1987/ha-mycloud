@@ -10,6 +10,11 @@ from typing import Any
 
 import asyncssh
 
+from .const import (
+    DEFAULT_POWER_PROBE_METHOD,
+    PROBE_METHOD_HDPARM,
+    PROBE_METHOD_SMARTCTL_SAT,
+)
 from .probe_diagnostics import PowerProbeError
 
 HDPARM_PATH = "/usr/bin/hdparm"
@@ -23,6 +28,97 @@ _STATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DEVICE_HEADER_PATTERN = re.compile(r"^\s*(/dev/(?:sd|hd)[a-z]+):\s*$")
+_SMARTCTL_DEVICE = "__MYCLOUD_DISK__ "
+_SMARTCTL_STATUS = "__MYCLOUD_STATUS__ "
+_SMARTCTL_STATE = re.compile(r"^Device is in (.+) mode(?:, exit\((\d+)\))?$")
+_SMARTCTL_UNKNOWN = re.compile(
+    r"^CHECK POWER MODE (?:returned unknown value 0x[0-9a-fA-F]+|not implemented), "
+    r"ignoring -n option$"
+)
+_SMARTCTL_AWAKE = frozenset({"ACTIVE or IDLE", "IDLE", "IDLE_A", "IDLE_B", "IDLE_C"})
+_SMARTCTL_ASLEEP = frozenset({"STANDBY", "STANDBY_Y", "STANDBY_Z", "SLEEP"})
+
+
+def build_smartctl_command(drive_devices: Sequence[str]) -> str:
+    """Build one framed SAT CHECK POWER MODE command for validated disks.
+
+    smartctl 7.2 exits after the power check when no further display/test
+    options are provided. Each result includes its validated path and its own
+    exit status; status 3 represents an asleep drive.
+    """
+    lines = []
+    for device in parse_drive_devices(drive_devices):
+        lines.extend((
+            f"printf '{_SMARTCTL_DEVICE}{device}\\n'",
+            f"LC_ALL=C smartctl -d sat -n standby,3 {device} 2>&1",
+            f"printf '{_SMARTCTL_STATUS}%s\\n' \"$?\"",
+        ))
+    return "\n".join(lines)
+
+
+def parse_smartctl_states(
+    output: str, drive_devices: Sequence[str]
+) -> dict[str, str]:
+    """Require a complete, unambiguous per-disk result; never infer awake."""
+    devices = parse_drive_devices(drive_devices)
+    sections: dict[str, tuple[list[str], int | None]] = {}
+    current = None
+    for line in output.splitlines():
+        if line.startswith(_SMARTCTL_DEVICE):
+            device = line.removeprefix(_SMARTCTL_DEVICE)
+            if device not in devices or device in sections:
+                raise ValueError("Unexpected or duplicate smartctl device")
+            if current is not None and sections[current][1] is None:
+                raise ValueError("Missing smartctl status")
+            current = device
+            sections[device] = ([], None)
+        elif line.startswith(_SMARTCTL_STATUS):
+            if current is None or sections[current][1] is not None:
+                raise ValueError("Unexpected smartctl status")
+            status_text = line.removeprefix(_SMARTCTL_STATUS)
+            if not status_text.isascii() or not status_text.isdecimal():
+                raise ValueError("Invalid smartctl status")
+            status = int(status_text)
+            if status not in (0, 3):
+                raise PowerProbeError(
+                    "smartctl power-state command failed", stage="command",
+                    error_type="command_failed", detail="nonzero_exit",
+                    exit_status=status, probe_type="smartctl_sat_power_state",
+                )
+            sections[current] = (sections[current][0], status)
+        elif current is not None:
+            if sections[current][1] is not None:
+                if line.strip():
+                    raise ValueError("Unexpected output after smartctl status")
+            else:
+                sections[current][0].append(line)
+        elif line.strip():
+            raise ValueError("Unframed smartctl output")
+    if set(sections) != set(devices):
+        raise ValueError("Missing smartctl device")
+
+    states = {}
+    for device in devices:
+        lines, status = sections[device]
+        matches = [
+            match for line in lines if (match := _SMARTCTL_STATE.fullmatch(line))
+        ]
+        unknowns = [line for line in lines if _SMARTCTL_UNKNOWN.fullmatch(line)]
+        if len(matches) + len(unknowns) != 1 or status is None:
+            raise ValueError("Missing or ambiguous smartctl power state")
+        if unknowns:
+            if status != 0:
+                raise ValueError("Unexpected smartctl unknown-state status")
+            states[device] = POWER_UNKNOWN
+            continue
+        state, printed_exit = matches[0].groups()
+        if state in _SMARTCTL_AWAKE and status == 0 and printed_exit is None:
+            states[device] = POWER_ACTIVE
+        elif state in _SMARTCTL_ASLEEP and status == 3 and printed_exit == "3":
+            states[device] = POWER_STANDBY
+        else:
+            raise ValueError("Unrecognized or inconsistent smartctl power state")
+    return states
 
 
 def parse_drive_devices(value: str | Sequence[str]) -> tuple[str, ...]:
@@ -127,7 +223,12 @@ class SSHPowerStateClient:
         drive_devices: Sequence[str],
         expected_fingerprint: str | None = None,
         timeout: float = 10.0,
+        *,
+        probe_method: str = DEFAULT_POWER_PROBE_METHOD,
     ) -> None:
+        if probe_method not in (PROBE_METHOD_HDPARM, PROBE_METHOD_SMARTCTL_SAT):
+            raise ValueError("Unsupported power probe method")
+        self._probe_method = probe_method
         self._host = host
         self._port = port
         self._username = username
@@ -141,6 +242,18 @@ class SSHPowerStateClient:
         self._process: Any | None = None
         self._process_running = False
         self._probe_lock = asyncio.Lock()
+
+    @property
+    def probe_type(self) -> str:
+        """Return an allowlisted diagnostic name for the selected probe."""
+        return (
+            "smartctl_sat_power_state"
+            if self._probe_method == PROBE_METHOD_SMARTCTL_SAT
+            else "hdparm_power_state"
+        )
+
+    def _probe_error(self, *args, **kwargs) -> PowerProbeError:
+        return PowerProbeError(*args, probe_type=self.probe_type, **kwargs)
 
     @property
     def fingerprint(self) -> str | None:
@@ -180,7 +293,7 @@ class SSHPowerStateClient:
                 timeout=self._timeout,
             )
         except Exception as err:
-            raise PowerProbeError(
+            raise self._probe_error(
                 "SSH connection or host-key validation failed",
                 stage="connect", detail="connect_failed",
                 duration_seconds=asyncio.get_running_loop().time() - started,
@@ -200,7 +313,12 @@ class SSHPowerStateClient:
         failure: BaseException | None = None
         try:
             connection = await self._async_connect()
-            command = f"{HDPARM_PATH} -C {' '.join(self._drive_devices)}"
+            use_smartctl = self._probe_method == PROBE_METHOD_SMARTCTL_SAT
+            command = (
+                build_smartctl_command(self._drive_devices)
+                if use_smartctl
+                else f"{HDPARM_PATH} -C {' '.join(self._drive_devices)}"
+            )
             started = asyncio.get_running_loop().time()
 
             async def run_command():
@@ -216,7 +334,7 @@ class SSHPowerStateClient:
                 # the retained process before closing the SSH connection.
                 result = await asyncio.wait_for(run_command(), timeout=self._timeout)
             except TimeoutError as err:
-                raise PowerProbeError(
+                raise self._probe_error(
                     "SSH power-state command timed out",
                     stage="command",
                     error_type="timeout",
@@ -226,7 +344,7 @@ class SSHPowerStateClient:
                     ),
                 ) from err
             if result.exit_status != 0:
-                raise PowerProbeError(
+                raise self._probe_error(
                     "SSH power-state command failed", stage="command",
                     error_type="command_failed", detail="nonzero_exit",
                     exit_status=result.exit_status,
@@ -236,11 +354,16 @@ class SSHPowerStateClient:
                 )
             output = f"{result.stdout or ''}\n{result.stderr or ''}"
             try:
-                states = parse_hdparm_states(output, self._drive_devices)
+                parser = parse_smartctl_states if use_smartctl else parse_hdparm_states
+                states = parser(output, self._drive_devices)
             except ValueError as err:
-                raise PowerProbeError(
-                    "Unrecognized hdparm response", stage="command",
-                    error_type="parse_failed", detail="unrecognized_hdparm_output",
+                raise self._probe_error(
+                    "Unrecognized power-state response", stage="command",
+                    error_type="parse_failed",
+                    detail=(
+                        "unrecognized_smartctl_output"
+                        if use_smartctl else "unrecognized_hdparm_output"
+                    ),
                     duration_seconds=(
                         asyncio.get_running_loop().time() - started
                     ),
@@ -248,7 +371,7 @@ class SSHPowerStateClient:
         except (PowerProbeError, asyncio.CancelledError) as err:
             failure = err
         except Exception as err:  # noqa: BLE001 - AsyncSSH exposes varied errors
-            failure = PowerProbeError(
+            failure = self._probe_error(
                 "SSH power-state command failed", stage="command", detail="command_failed",
             )
             failure.__cause__ = err
@@ -272,7 +395,7 @@ class SSHPowerStateClient:
                 failure = cleanup_error
         except Exception as cleanup_error:  # noqa: BLE001 - normalize SSH cleanup
             if failure is None:
-                failure = PowerProbeError(
+                failure = self._probe_error(
                     "SSH connection cleanup failed", stage="cleanup",
                     error_type="connection_failed", detail="cleanup_failed",
                 )
@@ -311,14 +434,14 @@ class SSHPowerStateClient:
                     process.wait_closed(), timeout=self._timeout
                 )
             except TimeoutError as err:
-                cleanup_failure = PowerProbeError(
+                cleanup_failure = self._probe_error(
                     "SSH process cleanup timed out", stage="cleanup",
                     error_type="timeout", detail="process_cleanup_timeout",
                 )
                 cleanup_failure.__cause__ = err
                 cleanup_failure.__suppress_context__ = True
             except Exception as err:  # noqa: BLE001 - normalize SSH cleanup
-                cleanup_failure = PowerProbeError(
+                cleanup_failure = self._probe_error(
                     "SSH process cleanup failed", stage="cleanup",
                     error_type="connection_failed", detail="cleanup_failed",
                 )
@@ -335,7 +458,7 @@ class SSHPowerStateClient:
                 abort = getattr(connection, "abort", None)
                 if callable(abort):
                     abort()
-                connection_failure = PowerProbeError(
+                connection_failure = self._probe_error(
                     "SSH connection cleanup timed out", stage="cleanup",
                     error_type="timeout", detail="cleanup_timeout",
                 )
@@ -343,7 +466,7 @@ class SSHPowerStateClient:
                 connection_failure.__suppress_context__ = True
                 cleanup_failure = cleanup_failure or connection_failure
             except Exception as err:  # noqa: BLE001 - normalize SSH cleanup
-                connection_failure = PowerProbeError(
+                connection_failure = self._probe_error(
                     "SSH connection cleanup failed", stage="cleanup",
                     error_type="connection_failed", detail="cleanup_failed",
                 )

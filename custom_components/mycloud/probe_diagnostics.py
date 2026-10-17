@@ -17,9 +17,9 @@ _ERROR_TYPES = {
 _DETAILS = {
     "probe_failed", "connect_failed", "command_failed", "nonzero_exit",
     "command_timeout", "unrecognized_hdparm_output", "cleanup_timeout",
-    "process_cleanup_timeout", "cleanup_failed",
+    "process_cleanup_timeout", "cleanup_failed", "unrecognized_smartctl_output",
 }
-_PROBE_TYPES = {"hdparm_power_state"}
+_PROBE_TYPES = {"hdparm_power_state", "smartctl_sat_power_state"}
 
 
 class PowerProbeError(Exception):

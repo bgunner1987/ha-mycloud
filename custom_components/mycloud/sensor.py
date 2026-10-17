@@ -20,6 +20,7 @@ from .const import (
     CACHE_STORE_VERSION,
     CONF_DRIVE_DEVICES,
     CONF_POWER_PROBE_INTERVAL,
+    CONF_POWER_PROBE_METHOD,
     CONF_SLEEP_AWARE_ENABLED,
     CONF_SSH_PASSWORD,
     CONF_SSH_PORT,
@@ -27,6 +28,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     DEFAULT_DRIVE_DEVICES,
     DEFAULT_POWER_PROBE_INTERVAL,
+    DEFAULT_POWER_PROBE_METHOD,
     DEFAULT_SSH_PORT,
     DEFAULT_SSH_USERNAME,
     DEFAULT_UPDATE_INTERVAL,
@@ -199,6 +201,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             password=config_entry.options.get(CONF_SSH_PASSWORD, ""),
             drive_devices=drive_devices,
             expected_fingerprint=cached_fingerprint,
+            probe_method=config_entry.options.get(
+                CONF_POWER_PROBE_METHOD, DEFAULT_POWER_PROBE_METHOD
+            ),
         )
 
     # Sleep-aware snapshots use a new HTTP client per permitted full poll. Legacy

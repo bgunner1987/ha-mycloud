@@ -14,6 +14,7 @@ from homeassistant.helpers.selector import (
 from .const import (
     CONF_DRIVE_DEVICES,
     CONF_POWER_PROBE_INTERVAL,
+    CONF_POWER_PROBE_METHOD,
     CONF_SLEEP_AWARE_ENABLED,
     CONF_SSH_PASSWORD,
     CONF_SSH_PORT,
@@ -21,6 +22,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     DEFAULT_DRIVE_DEVICES,
     DEFAULT_POWER_PROBE_INTERVAL,
+    DEFAULT_POWER_PROBE_METHOD,
     DEFAULT_SSH_PORT,
     DEFAULT_SSH_USERNAME,
     DEFAULT_UPDATE_INTERVAL,
@@ -28,6 +30,8 @@ from .const import (
     HOST,
     MIN_POWER_PROBE_INTERVAL,
     PASSWORD,
+    PROBE_METHOD_HDPARM,
+    PROBE_METHOD_SMARTCTL_SAT,
     USERNAME,
     VERSION,
 )
@@ -50,6 +54,7 @@ class MyCloudOptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is not None:
             current.update(user_input)
             current.setdefault(CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL)
+            current.setdefault(CONF_POWER_PROBE_METHOD, DEFAULT_POWER_PROBE_METHOD)
             try:
                 current[CONF_DRIVE_DEVICES] = _validate_drive_devices(
                     current.get(CONF_DRIVE_DEVICES, DEFAULT_DRIVE_DEVICES)
@@ -63,6 +68,15 @@ class MyCloudOptionsFlowHandler(config_entries.OptionsFlow):
 
         options_schema = vol.Schema(
             {
+                vol.Optional(
+                    CONF_POWER_PROBE_METHOD,
+                    default=current.get(
+                        CONF_POWER_PROBE_METHOD, DEFAULT_POWER_PROBE_METHOD
+                    ),
+                ): vol.In({
+                    PROBE_METHOD_HDPARM: "hdparm",
+                    PROBE_METHOD_SMARTCTL_SAT: "smartctl (SAT)",
+                }),
                 vol.Optional(
                     CONF_POWER_PROBE_INTERVAL,
                     default=current.get(
@@ -125,6 +139,7 @@ class MyCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
         current = dict(user_input or {})
         current.setdefault(CONF_POWER_PROBE_INTERVAL, DEFAULT_POWER_PROBE_INTERVAL)
+        current.setdefault(CONF_POWER_PROBE_METHOD, DEFAULT_POWER_PROBE_METHOD)
         if user_input is not None:
             try:
                 current[CONF_DRIVE_DEVICES] = _validate_drive_devices(
@@ -144,6 +159,7 @@ class MyCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     for key in (
                         CONF_UPDATE_INTERVAL,
                         CONF_POWER_PROBE_INTERVAL,
+                        CONF_POWER_PROBE_METHOD,
                         CONF_SLEEP_AWARE_ENABLED,
                         CONF_SSH_PORT,
                         CONF_SSH_USERNAME,
@@ -157,6 +173,15 @@ class MyCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
+                vol.Optional(
+                    CONF_POWER_PROBE_METHOD,
+                    default=current.get(
+                        CONF_POWER_PROBE_METHOD, DEFAULT_POWER_PROBE_METHOD
+                    ),
+                ): vol.In({
+                    PROBE_METHOD_HDPARM: "hdparm",
+                    PROBE_METHOD_SMARTCTL_SAT: "smartctl (SAT)",
+                }),
                 vol.Optional(
                     CONF_POWER_PROBE_INTERVAL,
                     default=current.get(

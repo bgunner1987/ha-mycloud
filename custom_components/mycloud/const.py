@@ -7,6 +7,10 @@ VERSION = "Version"
 
 CONF_UPDATE_INTERVAL = "update_interval"
 CONF_POWER_PROBE_INTERVAL = "power_probe_interval"
+CONF_POWER_PROBE_METHOD = "power_probe_method"
+PROBE_METHOD_HDPARM = "hdparm"
+PROBE_METHOD_SMARTCTL_SAT = "smartctl_sat"
+DEFAULT_POWER_PROBE_METHOD = PROBE_METHOD_HDPARM
 CONF_SLEEP_AWARE_ENABLED = "sleep_aware_enabled"
 CONF_SSH_PORT = "ssh_port"
 CONF_SSH_USERNAME = "ssh_username"
